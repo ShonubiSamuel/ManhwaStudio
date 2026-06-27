@@ -13,12 +13,13 @@ import { useResizableRail, RailDragHandle } from "./Rail"
 import { colors, fonts, radius } from "../theme"
 
 const NAV = [
-  { page: PAGES.LIBRARY,    label: "Library",    icon: "⊞" },
-  { page: PAGES.PIPELINE,   label: "Pipeline",   icon: "▶" },
-  { page: PAGES.DUB_STUDIO, label: "Dub Studio", icon: "🎬" },
-  { page: PAGES.DUBBING,    label: "Dubbing",    icon: "♪" },
-  { page: PAGES.SETTINGS,   label: "Settings",   icon: "⚙" },
-  { page: PAGES.LOGS,       label: "Logs",       icon: "≡" },
+  { page: PAGES.TRANSCRIPTION, label: "Transcription", icon: "≣" },
+  { page: PAGES.SUBTITLE,      label: "Subtitle",      icon: "▭" },
+  { page: PAGES.VOICEOVER,     label: "Voiceover",     icon: "🎙" },
+  { page: PAGES.REALTIME,      label: "Real-Time",     icon: "◉" },
+  { page: PAGES.VOICES,        label: "Voices",        icon: "♪" },
+  { page: PAGES.SETTINGS,      label: "Settings",      icon: "⚙" },
+  { page: PAGES.LOGS,          label: "Logs",          icon: "≡" },
 ]
 
 export default function Sidebar() {
@@ -81,32 +82,6 @@ export default function Sidebar() {
           />
         ))}
       </nav>
-
-      {/* ── Active episode badge ──────────────────────────────────────── */}
-      {state.activeEpisode && (
-        <>
-          <Divider collapsed={collapsed} />
-          {collapsed ? (
-            <button
-              onClick={() => dispatch(actions.setPage(PAGES.PIPELINE))}
-              title={`${state.activeEpisode.title} · ${state.activeEpisode.overall}%`}
-              style={{ display: "flex", justifyContent: "center", padding: "14px 0", background: "none", border: "none", cursor: "pointer" }}
-            >
-              <span style={{ width: 9, height: 9, borderRadius: "50%", background: colors.accent }} />
-            </button>
-          ) : (
-            <div onClick={() => dispatch(actions.setPage(PAGES.PIPELINE))} style={{ padding: "14px 20px", cursor: "pointer" }}>
-              <SectionLabel>ACTIVE EPISODE</SectionLabel>
-              <div style={{ color: colors.accent, fontSize: fonts.sm, fontWeight: fonts.medium, marginTop: 6, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {state.activeEpisode.title}
-              </div>
-              <div style={{ color: colors.muted, fontSize: fonts.xs, marginTop: 3 }}>
-                {state.activeEpisode.source_type.toUpperCase()}{" · "}{state.activeEpisode.overall}% complete
-              </div>
-            </div>
-          )}
-        </>
-      )}
 
       {!collapsed && <RailDragHandle onMouseDown={rail.onDragStart} />}
     </aside>

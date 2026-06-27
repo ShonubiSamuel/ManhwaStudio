@@ -23,19 +23,27 @@ import { createContext, useContext, useReducer } from "react"
 // ── Pages ─────────────────────────────────────────────────────────────────────
 
 export const PAGES = {
+  // ── AI Voice app sections (current) ──────────────────────────────────────
+  VOICEOVER:     "voiceover",     // the main, fully-built section
+  TRANSCRIPTION: "transcription", // coming soon
+  SUBTITLE:      "subtitle",      // coming soon
+  REALTIME:      "realtime",      // coming soon
+  VOICES:        "voices",        // voice library
+  SETTINGS:      "settings",
+  LOGS:          "logs",
+
+  // ── Legacy manhwa pages (retired from nav; kept so old files still compile)
   LIBRARY:    "library",
   PIPELINE:   "pipeline",
   DUB_STUDIO: "dub_studio",
   DUBBING:    "dubbing",
-  SETTINGS:   "settings",
-  LOGS:       "logs",
 }
 
 // ── Initial state ─────────────────────────────────────────────────────────────
 
 const initialState = {
   /** Which top-level page is currently visible. */
-  page: PAGES.LIBRARY,
+  page: PAGES.VOICEOVER,
 
   /** The project whose episodes are shown in the Library sidebar. */
   activeProjectId: null,

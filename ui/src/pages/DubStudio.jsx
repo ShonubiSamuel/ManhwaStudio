@@ -39,7 +39,7 @@ export default function DubStudio() {
   return <ProjectDubStudio key={projectId} projectId={projectId} />
 }
 
-function ProjectDubStudio({ projectId }) {
+export function ProjectDubStudio({ projectId, onBack }) {
   const { notify } = useNotify()
   const [loaded, setLoaded] = useState(false)
   const [cues, setCues] = useState(null)
@@ -55,21 +55,25 @@ function ProjectDubStudio({ projectId }) {
     let alive = true
     getDubSession(projectId).then((s) => {
       if (!alive) return
+      // Always apply the scalar settings (so a freshly-created project pre-fills
+      // the setup screen with the source + language picked in the New modal).
+      if (s && typeof s === "object") {
+        if (s.targetLang)  setTargetLang(s.targetLang)
+        if (s.sourcePath)  setSourcePath(s.sourcePath)
+        if (s.voice)       setVoice(s.voice)
+        if (s.ttsAudioUrl) setTtsAudioUrl(s.ttsAudioUrl)
+        if (Array.isArray(s.reviewed)) setReviewed(s.reviewed)
+      }
       if (s && Array.isArray(s.cues) && s.cues.length) {
         setCues(s.cues)
-        setTtsAudioUrl(s.ttsAudioUrl || "")
-        setTargetLang(s.targetLang || "French")
-        setSourcePath(s.sourcePath || "")
-        setVoice(s.voice || "")
-        setReviewed(Array.isArray(s.reviewed) ? s.reviewed : [])
       } else {
         try {
           const old = JSON.parse(localStorage.getItem("dub_cues") || "null")
           if (Array.isArray(old) && old.length) {
             setCues(old)
             setTtsAudioUrl(localStorage.getItem("dub_ttsAudioUrl") || "")
-            setTargetLang(localStorage.getItem("dub_targetLang") || "French")
-            setSourcePath(localStorage.getItem("dub_sourcePath") || "")
+            if (!s?.targetLang) setTargetLang(localStorage.getItem("dub_targetLang") || "French")
+            if (!s?.sourcePath) setSourcePath(localStorage.getItem("dub_sourcePath") || "")
             setVoice(localStorage.getItem("dub_voice") || "")
           }
         } catch { /* ignore */ }
@@ -174,6 +178,7 @@ function ProjectDubStudio({ projectId }) {
         setSourcePath={setSourcePath}
         targetLang={targetLang}
         setTargetLang={setTargetLang}
+        onBack={onBack}
       />
     )
   }
@@ -181,6 +186,7 @@ function ProjectDubStudio({ projectId }) {
   return (
     <AdvancedEditor
       projectId={projectId}
+      onBack={onBack}
       cues={cues} setCues={setCues}
       sourcePath={sourcePath} setSourcePath={setSourcePath}
       ttsAudioUrl={ttsAudioUrl}
@@ -242,7 +248,7 @@ function NoProjectScreen() {
    Setup screen
 ───────────────────────────────────────────────────────────────────────────── */
 
-function SetupScreen({ onExtracted, sourcePath, setSourcePath, targetLang, setTargetLang }) {
+function SetupScreen({ onExtracted, sourcePath, setSourcePath, targetLang, setTargetLang, onBack }) {
   const { notify } = useNotify()
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState("")
@@ -290,7 +296,10 @@ function SetupScreen({ onExtracted, sourcePath, setSourcePath, targetLang, setTa
   return (
     <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", background: colors.bg }}>
       <div style={{ width: 500, background: colors.panel, padding: 32, borderRadius: radius.lg, border: `1px solid ${colors.border}` }}>
-        <h2 style={{ color: colors.text, marginBottom: 8, fontSize: fonts.xxl, fontWeight: fonts.bold }}>Start Dubbing Project</h2>
+        {onBack && (
+          <button onClick={onBack} style={{ color: colors.textDim, fontSize: fonts.sm, marginBottom: 14 }}>← Back to projects</button>
+        )}
+        <h2 style={{ color: colors.text, marginBottom: 8, fontSize: fonts.xxl, fontWeight: fonts.bold }}>Start Voiceover Project</h2>
         <p style={{ color: colors.muted, marginBottom: 24, fontSize: fonts.sm }}>Extract the dialogue, translate it, and generate the {targetLang} voiceover — all in one step.</p>
 
         <div style={{ marginBottom: 20 }}>
@@ -352,7 +361,7 @@ function useSplitter({ initial, min, max, axis }) {
    Advanced editor
 ───────────────────────────────────────────────────────────────────────────── */
 
-function AdvancedEditor({ projectId, cues, setCues, sourcePath, ttsAudioUrl, targetLang, voice, setVoice, voices, reviewed, setReviewed, generateDub, busy, statusMsg }) {
+function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudioUrl, targetLang, voice, setVoice, voices, reviewed, setReviewed, generateDub, busy, statusMsg }) {
   const { notify } = useNotify()
   const [exporting, setExporting] = useState(false)
 
@@ -617,7 +626,7 @@ function AdvancedEditor({ projectId, cues, setCues, sourcePath, ttsAudioUrl, tar
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", width: "100%", background: colors.bg, color: colors.text, overflow: "hidden", fontFamily: fonts.ui }}>
 
       {/* Global top bar */}
-      <TopBar onExport={doExport} exporting={exporting} canExport={!!ttsAudioUrl} />
+      <TopBar onExport={doExport} exporting={exporting} canExport={!!ttsAudioUrl} onBack={onBack} />
 
       {/* Top split area */}
       <div style={{ display: "flex", flex: 1, minHeight: 0, overflow: "hidden" }}>
@@ -779,11 +788,17 @@ function AdvancedEditor({ projectId, cues, setCues, sourcePath, ttsAudioUrl, tar
    Top bar
 ───────────────────────────────────────────────────────────────────────────── */
 
-function TopBar({ onExport, exporting, canExport }) {
+function TopBar({ onExport, exporting, canExport, onBack }) {
   const [menuOpen, setMenuOpen] = useState(false)
   return (
     <div style={{ height: 52, flexShrink: 0, background: colors.panel, borderBottom: `1px solid ${colors.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 16px" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        {onBack && (
+          <button onClick={onBack} title="Back to projects"
+            style={{ display: "flex", alignItems: "center", gap: 6, color: colors.textDim, background: colors.panel2, border: `1px solid ${colors.border}`, borderRadius: radius.md, padding: "6px 12px" }}>
+            ← Projects
+          </button>
+        )}
         <div style={{ display: "flex", alignItems: "center", gap: 8, border: `1px solid ${colors.accent}`, borderRadius: radius.full, padding: "6px 14px", color: colors.accent, fontWeight: fonts.bold }}>
           ✦ AI Summary
         </div>

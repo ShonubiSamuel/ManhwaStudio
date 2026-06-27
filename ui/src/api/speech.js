@@ -38,6 +38,11 @@ export function refineCue({ text, translated, start, end, langCode = "fr" }) {
   return post("/speech/refine-cue", { text, translated, start, end, lang_code: langCode })
 }
 
+/** The Voiceover landing list — projects + session metadata. */
+export function listVoiceoverProjects() {
+  return get("/voiceover/projects")
+}
+
 /** Load a project's saved Dub Studio session ({} if none yet). */
 export function getDubSession(projectId) {
   return get(`/speech/dub-session/${projectId}`)

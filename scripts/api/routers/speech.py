@@ -477,6 +477,34 @@ def _session_path(project_id: int) -> Path:
     return Path(config.OUTPUT_DIR) / str(project_id) / "dub_session.json"
 
 
+@router.get("/voiceover/projects")
+def list_voiceover_projects(db: Database = Depends(get_db)):
+    """The Voiceover landing list ('My Files'): every project with the metadata
+    its saved session carries (language, duration, cue count, dub status)."""
+    out = []
+    for row in db.list_projects():
+        pid = row["id"]
+        sess = {}
+        p = _session_path(pid)
+        if p.exists():
+            try:    sess = json.loads(p.read_text(encoding="utf-8"))
+            except Exception: sess = {}
+        cues = sess.get("cues") or []
+        duration = max((float(c.get("end", 0)) for c in cues), default=0.0) if cues else 0.0
+        out.append({
+            "id":          pid,
+            "title":       row.get("name") or f"Project {pid}",
+            "language":    sess.get("targetLang") or "",
+            "source_path": sess.get("sourcePath") or "",
+            "cue_count":   len(cues),
+            "duration":    round(duration, 2),
+            "has_dub":     bool(sess.get("ttsAudioUrl")),
+            "updated_at":  sess.get("updatedAt") or row.get("updated_at"),
+            "created_at":  row.get("created_at"),
+        })
+    return out
+
+
 @router.get("/speech/dub-session/{project_id}")
 def get_dub_session(project_id: int, db: Database = Depends(get_db)):
     if not db.get_project(project_id):
