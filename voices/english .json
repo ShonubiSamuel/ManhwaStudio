@@ -1,0 +1,19 @@
+{
+  "name": "english ",
+  "mode": "VoiceClone",
+  "model": "1.7B-Base",
+  "language": "English",
+  "speaker": "Aiden",
+  "instruct": "",
+  "ref_wav_path": "/Users/samuelshonubi/Documents/ManhwaStudio/voices/refs/english .wav",
+  "ref_wav_text": "sending the snow bunny angel stumbling back on her feet. She can't even process it. A human just hit her. Before she can say a word, she falls to her knees, confused with her angelical blood leaving her nose. So she turns to kill the bastard.",
+  "x_vector_only": false,
+  "temperature": 0.7,
+  "top_p": 1.0,
+  "top_k": 50,
+  "repetition_penalty": 1.1,
+  "max_new_tokens": 2048,
+  "seed": 42,
+  "created_at": 1782075937.495261,
+  "updated_at": 1782076455.069338
+}
