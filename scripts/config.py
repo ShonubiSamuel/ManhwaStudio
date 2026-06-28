@@ -298,9 +298,28 @@ DUB_SPEECH_MAX_STRETCH = 1.3
 # line can never bleed onto the next (overlap = two voices = a "broken" sound).
 DUB_SPEECH_MIN_GAP = 0.06
 
+# ── Breathing room (reduce long silences WITHOUT stretching the speech) ───────
+# A line shorter than its slot leaves dead air. Instead of slowing the voice
+# (which sounds dragged) we LENGTHEN the natural pauses BETWEEN its phrases so it
+# breathes across the slot — the spoken words are never touched. Each pause is
+# capped so it never sounds like the narrator froze; whatever can't be filled
+# naturally stays as a (capped) tail pause.
+DUB_BREATHE_ENABLE     = True
+DUB_BREATHE_FILL_RATIO = 0.85   # spread the line to fill up to this much of its slot
+DUB_BREATHE_MAX_PAUSE  = 0.4    # never let a single internal pause exceed this (s)
+
 # ── Voice mastering (final pass) ──────────────────────────────────────────────
 # Raw TTS is dark/boomy/hot; this brightens, evens, and level-normalises the
 # assembled dub so it sounds like a pro track. See speech/master.py.
+# Per-cue "running start": prefix every cue with a short throwaway word in its
+# OWN generation so the first real words come out stable (no hum/wobble/breath),
+# then strip the prefix back off by pause detection. Prevents the artifact at the
+# source on every line — more reliable than detecting each artifact after the
+# fact. WARMUP_WORD ends in a period so the model pauses (a clean cut point); tune
+# it (e.g. "Voilà.", "Alors.") if its tone ever bleeds through.
+DUB_WARMUP_PER_CUE = True
+DUB_WARMUP_WORD    = "Bon."
+
 DUB_MASTER_ENABLE       = True
 DUB_MASTER_LUFS         = -16.0    # dialogue loudness target (online/streaming)
 DUB_MASTER_TP           = -1.5     # true-peak ceiling (dBTP) — keeps headroom

@@ -66,6 +66,139 @@ def _trim_silence(y, sr: int, thr_db: float = -38.0, guard_ms: float = 15.0):
     return y[a:b]
 
 
+def strip_leading_hum(y, sr: int, min_dur: float = 0.25, max_centroid: float = 320.0,
+                      max_std: float = 110.0, min_pause: float = 0.05):
+    """Remove a non-lexical 'hmm/mmm' the model sometimes hums BEFORE the words.
+    Such a hum is a long, low-pitched, dead-FLAT voiced segment (almost no
+    spectral movement) followed by a pause, then the real speech. Real first
+    words always have more spectral movement, so this is very specific and won't
+    clip them (verified: only fires on the hum, words preserved). Returns the clip
+    with the hum + its pause removed, or unchanged if no hum is found."""
+    import numpy as np
+    fl = int(sr * 0.01); n = len(y) // fl
+    if n < 8:
+        return y
+    fr = y[:n * fl].reshape(n, fl)
+    env = np.sqrt(np.mean(fr ** 2, axis=1) + 1e-12)
+    thr = max(float(env.max()) * 0.06, float(np.percentile(env, 90)) * 0.1)
+    v = env > thr
+    vi = np.where(v)[0]
+    if len(vi) < 2:
+        return y
+    a = int(vi[0]); b = a
+    while b < n and v[b]:
+        b += 1
+    if (b - a) * 0.01 < min_dur:                # too short to be a hum → a normal onset
+        return y
+    cen = []
+    for i in range(a, b):
+        s = fr[i]
+        m = np.abs(np.fft.rfft(s * np.hanning(len(s))))
+        f = np.fft.rfftfreq(len(s), 1.0 / sr)
+        cen.append((f * m ** 2).sum() / ((m ** 2).sum() + 1e-12))
+    cen = np.array(cen)
+    if cen.mean() >= max_centroid or cen.std() >= max_std:   # not low+flat → real speech
+        return y
+    j = b
+    while j < n and not v[j]:
+        j += 1
+    if j >= n or (j - b) * 0.01 < min_pause:    # no pause after → not a separable hum
+        return y
+    return y[((b + j) // 2) * fl:]              # cut through the pause after the hum
+
+
+def trim_onset_wobble(y, sr: int, settle_pct: float = 0.35, keep_ms: float = 20.0):
+    """Trim the soft, unstable lead-in some TTS clips have before the word forms
+    (the model's onset/first-token instability — the 'shaky' start). Finds the
+    first point where energy SUSTAINS above a fraction of the clip's loud level
+    and cuts just before it, keeping a small lead so the word's true onset isn't
+    clipped. No fade here — the assembler fades each clip. Verified to preserve
+    the words (ASR transcribes identically before/after)."""
+    import numpy as np
+    if len(y) == 0:
+        return y
+    fl = int(sr * 0.01); n = len(y) // fl
+    if n < 6:
+        return y
+    env = np.sqrt(np.mean(y[:n * fl].reshape(n, fl) ** 2, axis=1) + 1e-12)
+    thr = float(np.percentile(env, 90)) * settle_pct
+    onset = None
+    for i in range(n - 4):
+        if np.mean(env[i:i + 4]) > thr:       # 40 ms sustained above threshold
+            onset = i
+            break
+    if not onset:                              # already starts clean (or all quiet)
+        return y
+    cut = max(0, onset * fl - int(keep_ms / 1000.0 * sr))
+    return y[cut:]
+
+
+def _breathe(y, sr: int, target_dur: float, max_pause: float = 0.7):
+    """Spread a short clip toward target_dur by LENGTHENING the natural pauses
+    BETWEEN its phrases (the silences the voice already left) — the spoken words
+    are never touched (no stretching, no pitch change). Each pause is capped at
+    max_pause so it never sounds frozen. Returns the expanded clip; if there are
+    no internal pauses to grow, returns it unchanged (a single breath can't be
+    invented mid-word)."""
+    import numpy as np
+    cur = len(y) / sr
+    slack = target_dur - cur
+    if slack <= 0.05 or len(y) < int(sr * 0.2):
+        return y
+    fl = int(sr * 0.01); n = len(y) // fl
+    if n < 6:
+        return y
+    env = np.sqrt(np.mean(y[:n * fl].reshape(n, fl) ** 2, axis=1) + 1e-12)
+    thr = max(float(np.percentile(env, 90)) * 0.08, float(env.max()) * 0.05)
+    voiced = env > thr
+    vi = np.where(voiced)[0]
+    if len(vi) < 2:
+        return y
+    f0, f1 = vi[0], vi[-1]
+
+    # Interior silence runs (speech both before and after). ONLY real phrase
+    # pauses (commas/clauses) are growable — a min length filter excludes the
+    # tiny gaps BETWEEN words and the quiet dips INSIDE words, so we never chop
+    # speech into a stuttery mess (that was the "broken" sound).
+    min_run = max(2, int(0.12 * sr / fl))      # ≥120 ms = a genuine pause
+    runs, i = [], f0
+    while i <= f1:
+        if not voiced[i]:
+            j = i
+            while j <= f1 and not voiced[j]:
+                j += 1
+            if j <= f1 and (j - i) >= min_run:
+                runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    if not runs:
+        return y
+
+    # Grow each real pause toward max_pause, but cap how much we ADD to any one
+    # pause so a single line never collects many long gaps.
+    plan, headroom = [], 0.0
+    for (a, b) in runs:
+        cur_len = (b - a) * fl / sr
+        head = max(0.0, min(max_pause - cur_len, 0.18))   # add ≤0.18 s per pause (stay natural)
+        plan.append((a, b, head))
+        headroom += head
+    if headroom <= 0.01:
+        return y
+
+    scale = min(1.0, slack / headroom)
+    out, prev = [], 0
+    for (a, b, head) in plan:
+        mid = ((a + b) // 2) * fl
+        out.append(y[prev:mid])
+        add = int(head * scale * sr)
+        if add > 0:
+            out.append(np.zeros(add, dtype=y.dtype))
+        prev = mid
+    out.append(y[prev:])
+    return np.concatenate(out)
+
+
 def _normalize(y, target_rms: float = 0.12, max_gain: float = 6.0):
     """Bring every cue to a consistent loudness so the track doesn't jump
     cue-to-cue (a major source of 'inconsistent' dub). Peak-limited to avoid
@@ -107,6 +240,11 @@ def assemble_track(
     # Clean gap kept between a cue's end and the next cue's start, so a line can
     # never bleed onto the next one (overlap = two voices = the "broken" sound).
     min_gap = rs.get_float("dub_speech_min_gap", getattr(config, "DUB_SPEECH_MIN_GAP", 0.06))
+    # Breathing room: fill long silences by lengthening a short line's internal
+    # pauses (no stretching) instead of leaving dead air.
+    breathe       = bool(getattr(config, "DUB_BREATHE_ENABLE", True))
+    breathe_fill  = rs.get_float("dub_breathe_fill_ratio", getattr(config, "DUB_BREATHE_FILL_RATIO", 0.85))
+    breathe_pause = rs.get_float("dub_breathe_max_pause",  getattr(config, "DUB_BREATHE_MAX_PAUSE", 0.7))
 
     clips = []
     for p in placements:
@@ -159,6 +297,15 @@ def assemble_track(
                 except Exception as exc:
                     log(f"  cue {i}: stretch failed ({exc}) — placing as-is", "warning")
                     note = "as-is(no stretch)"
+        elif breathe and dur < (slot - min_gap) * breathe_fill:
+            # Short line in a long slot → breathe: lengthen its internal pauses
+            # (speech untouched) so it spreads toward the slot instead of leaving
+            # one long dead-air gap. Capped per pause.
+            target = (slot - min_gap) * breathe_fill
+            y2 = _breathe(y, sr, target, breathe_pause)
+            if len(y2) > len(y):
+                note = f"breathed {dur:.1f}→{len(y2)/sr:.1f}s"
+                y = y2
 
         gap = (nxt - (start + len(y) / sr))
         log(f"   place cue {i + 1:02d} @ {start:6.2f}s  {dur:.1f}s→slot {slot:.1f}s  "

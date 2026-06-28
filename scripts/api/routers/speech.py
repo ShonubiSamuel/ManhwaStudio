@@ -13,6 +13,7 @@ The run streams logs/progress through the same SSE channel as the pipeline
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 from pathlib import Path
 from typing import List, Optional
@@ -398,6 +399,220 @@ def adhoc_sync_status(job_id: str):
         if not job:
             raise HTTPException(404, "Job not found")
         return AdhocSyncJob(**job)
+
+
+# ── Per-cue dubbing (TTS each line separately → place → master) ───────────────
+# Replaces the fragile "one continuous read + split" path. Each cue is its own
+# clean clip, so there are NO mid-word cuts and NO leaked warm-up. Generated in a
+# SINGLE model load (consistent timbre) with a discarded warm-up first (stabilises
+# the first real line) and per-clip loudness levelling (even cue-to-cue volume —
+# the inconsistency that short clips used to cause).
+
+class DubCuesRequest(BaseModel):
+    cues:       List[dict]
+    voice:      str
+    lang_code:  str = "French"
+    project_id: Optional[int] = None
+    warmup:     Optional[str] = "Bonjour à tous."   # discarded first generation
+
+
+def _balanced_comma_split(text: str):
+    """Split a line into two halves at the comma nearest its middle (so a short
+    line can breathe a real pause at a genuine boundary). Returns [text] if there
+    is no usable comma."""
+    import re
+    commas = [m.start() for m in re.finditer(",", text)]
+    if not commas:
+        return [text]
+    mid = len(text) / 2
+    c = min(commas, key=lambda i: abs(i - mid))
+    a, b = text[:c].strip(), text[c + 1:].strip()
+    return [a, b] if a and b else [text]
+
+
+def _level_clip(path: str, target_rms: float = 0.08, max_gain: float = 4.0):
+    """Bring a clip toward a common loudness so cues don't jump in volume."""
+    import soundfile as sf, numpy as np
+    try:
+        y, sr = sf.read(path, dtype="float32", always_2d=False)
+    except Exception:
+        return
+    if getattr(y, "ndim", 1) > 1:
+        y = y.mean(axis=1)
+    rms = float(np.sqrt(np.mean(y ** 2))) if len(y) else 0.0
+    if rms < 0.005:                       # near-silent — don't amplify noise
+        return
+    y = y * min(target_rms / rms, max_gain)
+    peak = float(np.max(np.abs(y))) if len(y) else 0.0
+    if peak > 0.99:
+        y = y * (0.99 / peak)
+    sf.write(path, y.astype("float32"), sr, subtype="PCM_16")
+
+
+def _run_dub_cues(job_id: str, req: DubCuesRequest):
+    from tts import synth
+    from tts.voice_profile import VoiceProfileManager
+    from speech import aligner, cps
+    from speech.master import master
+    import soundfile as sf
+
+    def _set(**kw):
+        with _adhoc_sync_jobs_lock:
+            if job_id in _adhoc_sync_jobs:
+                _adhoc_sync_jobs[job_id].update(kw)
+    def _log(msg, level="info"):
+        with _adhoc_sync_jobs_lock:
+            if job_id in _adhoc_sync_jobs:
+                _adhoc_sync_jobs[job_id]["log"].append({"timestamp": __import__("time").time(), "level": level, "message": msg})
+
+    try:
+        vpm = VoiceProfileManager(str(config.VOICES_DIR))
+        profile = vpm.load(req.voice)
+        if not profile:
+            _set(status="failed", error=f"Voice '{req.voice}' not found"); return
+        profile.language = req.lang_code
+
+        cues = req.cues
+        if not cues:
+            _set(status="failed", error="No cues to dub"); return
+
+        if req.project_id is not None:
+            work = Path(config.OUTPUT_DIR) / str(req.project_id) / "dub" / req.lang_code
+        else:
+            work = Path(config.OUTPUT_DIR) / "adhoc_sync" / job_id
+        work.mkdir(parents=True, exist_ok=True)
+
+        # Build the flat segment list. A cue that is clearly SHORT for its slot
+        # and has a comma is split in two so it can breathe a pause at that real
+        # boundary (instead of one chunk + long trailing silence).
+        comf = cps.comfortable_cps(req.lang_code)
+        warm = (req.warmup or "").strip()
+        # Per-cue warm-up: give EVERY cue a short throwaway prefix (default "Bon.")
+        # in its own generation, then strip it. This gives every line a "running
+        # start" so its first words synthesise stable (no hum/wobble/breath) — the
+        # general fix, not just for cue 1. Tune DUB_WARMUP_WORD to taste.
+        per_cue   = bool(getattr(config, "DUB_WARMUP_PER_CUE", False))
+        warm_word = (getattr(config, "DUB_WARMUP_WORD", "Bon.") or "").strip()
+        segments = []   # {cue, sub, text, path, start, dur}
+        for i, c in enumerate(cues):
+            text = (c.get("translated") or "").strip()
+            start = float(c.get("start", 0)); end = float(c.get("end", 0))
+            nxt = float(cues[i + 1]["start"]) if i + 1 < len(cues) else end
+            slot = max(0.05, nxt - start)
+            est = (len(text) / comf) if comf else 0.0       # expected speech seconds
+            # Say the whole line as ONE clip so its comma pause is the AI's own
+            # natural pause (like Maestra), NOT a gap our code inserts between two
+            # split halves — that inserted gap was the long, unnatural silence.
+            # Slot-filling is handled by breathing (lengthening the real pause).
+            parts = [text]
+            for s, part in enumerate(parts):
+                seg = {"cue": i, "sub": s, "nsub": len(parts), "text": part,
+                       "path": str(work / f"cue_{i:04d}_{s}.wav"), "slot": slot, "start": start, "next": nxt}
+                # Warm the model up INSIDE the first clip's OWN generation, so the
+                # first real words aren't synthesised as an unstable "first
+                # utterance" (the hiccup). The warm-up audio is stripped back off
+                # after synthesis. A separate warm-up clip does NOT help — the
+                # model resets per generation, so the prefix must share the call.
+                if s == 0:
+                    if per_cue and warm_word:                 # every cue gets a running start
+                        seg["text"] = f"{warm_word} {part}"
+                        seg["strip_warmup"] = warm_word
+                    elif warm and i == 0:                     # else just cue 1 (old behaviour)
+                        seg["text"] = f"{warm} {part}"
+                        seg["strip_warmup"] = warm
+                segments.append(seg)
+
+        _set(message="Generating voiceover (per cue)…")
+        sentences = [s["text"] for s in segments]
+        outpaths  = [s["path"] for s in segments]
+        script = synth.build_synth_script(profile=profile, sentences=sentences, output_paths=outpaths, skip_indices=set())
+        r = subprocess.run([synth.synth_python(profile), "-c", script], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=1800, env=synth.synth_env(profile))
+        made = sum(1 for s in segments if Path(s["path"]).exists())
+        if made < len([s for s in segments if s["cue"] >= 0]):
+            _set(status="failed", error="Synthesis failed.\n" + (r.stdout or "")[-300:] + "\n" + (r.stderr or "")[-400:]); return
+
+        # Clean each clip's onset, then level for consistent loudness:
+        #  • the first clip: strip the prepended warm-up lead (by pause), and
+        #  • EVERY clip: trim the soft "shaky" onset wobble (model first-token
+        #    instability) without clipping the word.
+        from speech.wordsplit import strip_lead_segment
+        _set(message="Cleaning & levelling clips…")
+        for s in segments:
+            if not Path(s["path"]).exists():
+                continue
+            try:
+                y, sr = sf.read(s["path"])
+                if getattr(y, "ndim", 1) > 1:
+                    y = y.mean(axis=1)
+                if s.get("strip_warmup"):
+                    y2, stripped = strip_lead_segment(y, sr, on_log=_log)
+                    if stripped < 0.15:               # no clear pause → estimate & trim
+                        est = len(s["strip_warmup"]) / max(1.0, comf) + 0.15
+                        cut = int(min(est, len(y) / sr * 0.6) * sr)
+                        y2 = y[cut:]
+                        _log(f"warm-up: estimate-trimmed {cut / sr:.2f}s lead", "muted")
+                    y = y2
+                y = aligner.strip_leading_hum(y, sr)   # remove a 'hmm/mmm' lead-in
+                y = aligner.trim_onset_wobble(y, sr)   # remove the shaky lead-in
+                sf.write(s["path"], y, sr)
+            except Exception as exc:
+                _log(f"onset clean failed for cue {s['cue']}: {exc}", "warning")
+            _level_clip(s["path"])
+
+        # Build placements. Single-clip cues: at the cue start. Split cues: place
+        # the two halves with the leftover slot time as a real pause between them.
+        placements = []
+        real = [s for s in segments if s["cue"] >= 0 and Path(s["path"]).exists()]
+        # group by cue
+        by_cue = {}
+        for s in real:
+            by_cue.setdefault(s["cue"], []).append(s)
+        for i, group in by_cue.items():
+            group.sort(key=lambda s: s["sub"])
+            start = group[0]["start"]; nxt = group[0]["next"]; slot = max(0.05, nxt - start)
+            durs = []
+            for s in group:
+                try:
+                    y, sr = sf.read(s["path"]); durs.append((len(y) / sr) if sr else 0.0)
+                except Exception:
+                    durs.append(0.0)
+            if len(group) == 1:
+                placements.append({"path": group[0]["path"], "start": start})
+            else:
+                gap = max(0.15, (slot - sum(durs) - 0.08) / max(1, len(group) - 1))
+                t = start
+                for s, d in zip(group, durs):
+                    placements.append({"path": s["path"], "start": round(t, 3)})
+                    t += d + gap
+        placements.sort(key=lambda p: p["start"])
+
+        total_duration = max(float(c.get("end", 0)) for c in cues) + 2.0
+        _set(message="Assembling track…")
+        raw = str(work / "synced_raw.wav")
+        if not aligner.assemble_track(placements, total_duration, raw, on_log=_log):
+            _set(status="failed", error="Assembly failed."); return
+
+        _set(message="Mastering audio…")
+        final = str(work / "synced_final.wav")
+        if not master(raw, final, on_log=_log):
+            final = raw
+        _set(status="done", message="Dub complete!", synced_audio_url=_files_url(Path(final)))
+        _log("▶ Per-cue dub complete.", "success")
+    except Exception as exc:
+        _set(status="failed", error=str(exc))
+        _log(f"Fatal error: {exc}", "error")
+
+
+@router.post("/speech/dub-cues", response_model=AdhocSyncJob)
+def dub_cues(req: DubCuesRequest):
+    import uuid as _uuid
+    job_id = str(_uuid.uuid4())
+    with _adhoc_sync_jobs_lock:
+        _adhoc_sync_jobs[job_id] = {"job_id": job_id, "status": "running", "message": "Queued …",
+                                    "synced_audio_url": "", "log": [], "error": ""}
+    threading.Thread(target=_run_dub_cues, args=(job_id, req), daemon=True).start()
+    return AdhocSyncJob(**_adhoc_sync_jobs[job_id])
 
 
 # ── Refine one cue (the per-cue ✦AI button) ──────────────────────────────────

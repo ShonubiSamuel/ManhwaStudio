@@ -14,8 +14,8 @@
  */
 
 import { useState, useEffect, useRef, useCallback, useMemo, forwardRef } from "react"
-import { listVoices, quickTTS, quickTTSStatus } from "../api/voices"
-import { startAdhocTranslate, getAdhocTranslateStatus, startAdhocSync, getAdhocSyncStatus, refineCue, getDubSession, saveDubSession, exportDub } from "../api/speech"
+import { listVoices } from "../api/voices"
+import { startAdhocTranslate, getAdhocTranslateStatus, getAdhocSyncStatus, startDubCues, refineCue, getDubSession, saveDubSession, exportDub } from "../api/speech"
 import { listProjects } from "../api/projects"
 import { useApp, actions } from "../store/app"
 import { useNotify } from "../store/notify"
@@ -119,34 +119,24 @@ export function ProjectDubStudio({ projectId, onBack }) {
     if (!useVoice) { notify({ severity: "error", message: "No voice available — add one under Voices first." }); return }
     setBusy(true)
     try {
-      setStatusMsg("Generating voiceover (TTS)…")
-      // Prepend a throwaway "warm-up" line: TTS models are unstable on their
-      // very first utterance (the breath/hiccup you hear). The model warms up on
-      // this line; sync then strips it (see lead_dummy) so the first REAL cue
-      // starts clean. Keep it ONE short fluent phrase with NO commas, so it has
-      // no internal pause — the strip cuts at the first pause, i.e. right after it.
-      const LEAD_DUMMY = "Bonjour à tous."
-      const text = [LEAD_DUMMY, ...useCues.map((c) => c.translated)].join("\n")
-      const ttsStart = await quickTTS(text, useVoice, targetLang, projectId, targetLang)
-      let curTTS = ttsStart
-      while (curTTS.status === "running") {
+      // Per-cue dubbing: each line is synthesized as its own clean clip (one
+      // model load), then placed + mastered. No continuous-read splitting, so no
+      // mid-word cuts and no leaked warm-up.
+      setStatusMsg("Generating voiceover…")
+      const start = await startDubCues(useCues, useVoice, targetLang, projectId)
+      let cur = start
+      while (cur.status === "running") {
         await sleep(1500)
-        curTTS = await quickTTSStatus(ttsStart.job_id)
-        if (curTTS.message) setStatusMsg(curTTS.message)
+        cur = await getAdhocSyncStatus(start.job_id)
+        if (cur.message) setStatusMsg(cur.message)
       }
-      if (curTTS.status === "failed") throw new Error(curTTS.error || "TTS failed")
-      setTtsAudioUrl(curTTS.audio_url)
-
-      setStatusMsg("Syncing audio to the timeline…")
-      const syncStart = await startAdhocSync(curTTS.audio_url, useCues, targetLang, projectId, LEAD_DUMMY)
-      let curSync = syncStart
-      while (curSync.status === "running") {
-        await sleep(1500)
-        curSync = await getAdhocSyncStatus(syncStart.job_id)
-        if (curSync.message) setStatusMsg(curSync.message)
-      }
-      if (curSync.status === "failed") throw new Error(curSync.error || "Sync failed")
-      setTtsAudioUrl(curSync.synced_audio_url)
+      if (cur.status === "failed") throw new Error(cur.error || "Dub failed")
+      // Cache-bust: the file path is identical across regenerations, so without a
+      // unique query the <audio> element replays the browser's STALE cached copy
+      // (clean file on disk, old audio in the app). The query is ignored by the
+      // /files static server. This is why the app could differ from the file.
+      const base = (cur.synced_audio_url || "").split("?")[0]
+      setTtsAudioUrl(`${base}?v=${Date.now()}`)
       notify({ severity: "success", message: "Dub generated!" })
     } catch (err) {
       notify({ severity: "error", message: err.message })

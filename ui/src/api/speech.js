@@ -26,6 +26,12 @@ export function startAdhocSync(audioUrl, cues, langCode = "fr", projectId = null
   return post("/speech/adhoc-sync", { audio_url: audioUrl, cues, lang_code: langCode, project_id: projectId, lead_dummy: leadDummy })
 }
 
+/** Per-cue dubbing: synthesize each line separately, place, master. One call →
+ *  poll with getAdhocSyncStatus. Replaces the TTS-read + split flow. */
+export function startDubCues(cues, voice, langCode = "French", projectId = null) {
+  return post("/speech/dub-cues", { cues, voice, lang_code: langCode, project_id: projectId })
+}
+
 export function getAdhocSyncStatus(jobId) {
   return get(`/speech/adhoc-sync/${jobId}`)
 }
