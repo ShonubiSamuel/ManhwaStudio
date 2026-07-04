@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 import config
 from api.routers import (
     projects, episodes, pipeline, settings, panels, dubbing, detect,
-    translate, sync, logs, voices, speech, media,
+    translate, sync, logs, voices, speech, media, video_refine,
 )
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -61,6 +61,7 @@ app.include_router(logs.router,       prefix="/api")
 app.include_router(voices.router,     prefix="/api")
 app.include_router(speech.router,     prefix="/api")
 app.include_router(media.router,      prefix="/api")
+app.include_router(video_refine.router, prefix="/api")
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

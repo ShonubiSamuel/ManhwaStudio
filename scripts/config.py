@@ -40,7 +40,7 @@ LOGS_DIR   = BASE_DIR / "logs"
 # The API key is stored in the database (settings table) — not here.
 # Get a key at: https://build.nvidia.com → any model card → Get API Key
 NVIDIA_BASE_URL     = "https://integrate.api.nvidia.com/v1"
-NVIDIA_MODEL        = "meta/llama-3.3-70b-instruct"          # text: clean / translate
+NVIDIA_MODEL        = "meta/llama-3.1-70b-instruct"          # text: clean / translate
 NVIDIA_VISION_MODEL = "meta/llama-3.2-90b-vision-instruct"   # PDF narration (vision)
 
 

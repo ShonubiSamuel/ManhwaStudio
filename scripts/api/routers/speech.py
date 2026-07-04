@@ -150,6 +150,23 @@ def get_cues(episode_id: int, lang: str, db: Database = Depends(get_db)):
         return []
 
 
+def _persist_adhoc_log(job_id: str, stage: str, db: Database, duration_secs: float, is_sync_job: bool = False, project_name: str = "Dub Studio"):
+    job = _adhoc_sync_jobs.get(job_id) if is_sync_job else _adhoc_jobs.get(job_id)
+    if not job:
+        return
+    try:
+        db.log_adhoc_activity(
+            stage=stage,
+            status=job.get("status", "failed"),
+            duration_secs=duration_secs,
+            log_lines=job.get("log", []),
+            error=job.get("error", ""),
+            project_name=project_name
+        )
+    except Exception:
+        pass
+
+
 @router.get("/speech/result/{episode_id}/{lang}")
 def get_result(episode_id: int, lang: str, db: Database = Depends(get_db)):
     """Everything the editor needs for a language: cues + playable URLs."""
@@ -174,18 +191,28 @@ def get_result(episode_id: int, lang: str, db: Database = Depends(get_db)):
     }
 
 
-def _run_adhoc_translate(job_id: str, source_path: str, lang: str, db: Database):
+def _run_adhoc_translate(job_id: str, source_path: str, lang: str):
     from speech import segmenter, translate_cues
+    from database import Database
+    import config
     import time
+    start_time = time.time()
+    db = Database(str(config.DB_PATH))
+    
+    log_id = db.log_adhoc_start("translate_cues")
     
     def _set(status=None, message=None, cues=None, error=None):
         with _adhoc_jobs_lock:
             job = _adhoc_jobs.get(job_id)
             if not job: return
-            if status is not None: job["status"] = status
-            if message is not None: job["message"] = message
+            if status: job["status"] = status
             if cues is not None: job["cues"] = cues
-            if error is not None: job["error"] = error
+            if error: job["error"] = error
+            
+            if message:
+                job["log"].append({"timestamp": time.time(), "level": "info" if not error else "error", "message": message})
+            
+            db.log_adhoc_update(log_id, job["status"], job["log"], job.get("error", ""))
 
     def _log(msg: str, level: str = "info"):
         with _adhoc_jobs_lock:
@@ -196,6 +223,7 @@ def _run_adhoc_translate(job_id: str, source_path: str, lang: str, db: Database)
                     "level": level,
                     "message": msg
                 })
+                db.log_adhoc_update(log_id, job["status"], job["log"], job.get("error", ""))
 
     try:
         if not Path(source_path).exists():
@@ -203,10 +231,18 @@ def _run_adhoc_translate(job_id: str, source_path: str, lang: str, db: Database)
             return
 
         _set(message="Transcribing English audio into cues...")
-        _log("▶ Starting extraction and translation...", "accent")
+        _log("▶ Starting extraction...", "accent")
         cues = segmenter.transcribe_to_cues(source_path, "en", on_log=_log)
         if not cues:
             _set(status="failed", error="Failed to extract any cues from the audio.")
+            return
+
+        # Transcribe-only mode (Video Refine): skip translation entirely so the
+        # editor gets the raw English wording, untouched, with an empty 2nd slot.
+        if not lang or lang.strip().lower() in ("", "none", "transcribe", "original"):
+            for c in cues:
+                c["translated"] = ""
+            _set(status="done", message="Transcription complete", cues=cues)
             return
 
         _set(message=f"Translating {len(cues)} cues to {lang}...")
@@ -227,10 +263,16 @@ def _run_adhoc_translate(job_id: str, source_path: str, lang: str, db: Database)
             on_log=_log,
         )
 
+        if cues and all(not c.get("translated", "").strip() for c in translated) and any(c.get("text", "").strip() for c in cues):
+            _set(status="failed", error="Translation failed (check API keys and provider logs).")
+            return
+
         _set(status="done", message="Extraction and translation complete", cues=translated)
 
     except Exception as exc:
         _set(status="failed", error=str(exc))
+    finally:
+        db.close()
 
 
 @router.post("/speech/adhoc-translate", response_model=AdhocTranslateJob, status_code=202)
@@ -251,7 +293,7 @@ def adhoc_translate(body: AdhocTranslateRequest, db: Database = Depends(get_db))
         
     threading.Thread(
         target=_run_adhoc_translate,
-        args=(job_id, body.source_path, body.target_lang, db),
+        args=(job_id, body.source_path, body.target_lang),
         daemon=True,
         name=f"adhoctranslate-{job_id}"
     ).start()
@@ -268,6 +310,68 @@ def get_adhoc_translate_status(job_id: str):
     return AdhocTranslateJob(**job)
 
 
+# ── Translate EXISTING cues to a language (Video Refine, no re-transcribe) ────
+
+class TranslateCuesRequest(BaseModel):
+    cues:      List[dict]
+    lang_code: str
+
+
+def _run_translate_cues(job_id: str, cues: list, lang: str):
+    from database import Database
+    import config
+    from speech import translate_cues
+    import time
+    start_time = time.time()
+    db = Database(str(config.DB_PATH))
+    log_id = db.log_adhoc_start("translate_cues")
+
+    def _set(**kw):
+        with _adhoc_jobs_lock:
+            job = _adhoc_jobs.get(job_id)
+            if job: job.update({k: v for k, v in kw.items() if v is not None})
+            if job: db.log_adhoc_update(log_id, job["status"], job["log"], job.get("error", ""))
+
+    def _log(msg, level="info"):
+        with _adhoc_jobs_lock:
+            job = _adhoc_jobs.get(job_id)
+            if not job: return
+            job["log"].append({"timestamp": time.time(), "level": level, "message": msg})
+            db.log_adhoc_update(log_id, job["status"], job["log"], job.get("error", ""))
+
+    try:
+        _set(message=f"Translating {len(cues)} cues to {lang}...")
+        provider = db.get_setting("ai_provider_translate", "nvidia")
+        api_key  = db.get_setting("nvidia_api_key", "")
+        lm_model = db.get_setting("lm_studio_model", "")
+        try:    ctx = int(db.get_setting("lm_studio_context_length", "32768"))
+        except (TypeError, ValueError): ctx = 32768
+        translated = translate_cues.translate_cues(
+            cues=cues, lang_code=lang, provider=provider, api_key=api_key,
+            lm_studio_model=lm_model, context_length=ctx, fix_attempts=3, on_log=_log,
+        )
+        if cues and all(not c.get("translated", "").strip() for c in translated) and any(c.get("text", "").strip() for c in cues):
+            _set(status="failed", error="Translation failed (check API keys and provider logs).")
+            return
+        _set(status="done", message="Translation complete", cues=translated)
+    except Exception as exc:
+        _set(status="failed", error=str(exc))
+    finally:
+        db.close()
+
+
+@router.post("/speech/translate-cues", response_model=AdhocTranslateJob, status_code=202)
+def translate_cues_endpoint(body: TranslateCuesRequest, db: Database = Depends(get_db)):
+    if not body.cues:
+        raise HTTPException(400, "cues is required")
+    job_id = uuid.uuid4().hex[:12]
+    with _adhoc_jobs_lock:
+        _adhoc_jobs[job_id] = {"job_id": job_id, "status": "running", "message": "Queued ...", "cues": [], "log": [], "error": ""}
+    threading.Thread(target=_run_translate_cues, args=(job_id, body.cues, body.lang_code),
+                     daemon=True, name=f"translatecues-{job_id}").start()
+    return AdhocTranslateJob(**_adhoc_jobs[job_id])
+
+
 # ── Adhoc Sync ─────────────────────────────────────────────────────────────
 
 _adhoc_sync_jobs = {}
@@ -280,6 +384,11 @@ def _run_adhoc_sync(job_id: str, req: AdhocSyncRequest):
     import soundfile as sf
     from pathlib import Path
     from speech import wordsplit, aligner
+    import config
+    from database import Database
+    start_time = time.time()
+    db = Database(str(config.DB_PATH))
+    log_id = db.log_adhoc_start("adhoc_sync")
 
     def _set(status=None, message=None, synced_audio_url=None, error=None):
         with _adhoc_sync_jobs_lock:
@@ -289,6 +398,7 @@ def _run_adhoc_sync(job_id: str, req: AdhocSyncRequest):
             if message is not None: job["message"] = message
             if synced_audio_url is not None: job["synced_audio_url"] = synced_audio_url
             if error is not None: job["error"] = error
+            db.log_adhoc_update(log_id, job["status"], job["log"], job.get("error", ""))
 
     def _log(msg: str, level: str = "info"):
         with _adhoc_sync_jobs_lock:
@@ -299,6 +409,7 @@ def _run_adhoc_sync(job_id: str, req: AdhocSyncRequest):
                     "level": level,
                     "message": msg
                 })
+                db.log_adhoc_update(log_id, job["status"], job["log"], job.get("error", ""))
 
     try:
         if req.audio_url.startswith("/files/"):
@@ -372,9 +483,10 @@ def _run_adhoc_sync(job_id: str, req: AdhocSyncRequest):
     except Exception as exc:
         _set(status="failed", error=str(exc))
         _log(f"Fatal error: {exc}", "error")
-
-@router.post("/speech/adhoc-sync", response_model=AdhocSyncJob)
-def adhoc_sync(req: AdhocSyncRequest):
+    finally:
+        db.close()
+@router.post("/speech/adhoc-sync", response_model=AdhocSyncJob, status_code=202)
+def adhoc_sync(req: AdhocSyncRequest, db: Database = Depends(get_db)):
     import uuid
     import threading
     job_id = str(uuid.uuid4())
@@ -414,6 +526,7 @@ class DubCuesRequest(BaseModel):
     lang_code:  str = "French"
     project_id: Optional[int] = None
     warmup:     Optional[str] = "Bonjour à tous."   # discarded first generation
+    repack_timings: bool = False
 
 
 def _balanced_comma_split(text: str):
@@ -455,22 +568,25 @@ def _run_dub_cues(job_id: str, req: DubCuesRequest):
     from speech import aligner, cps
     from speech.master import master
     import soundfile as sf
+    import time
+    from database import Database
+    start_time = time.time()
+    db = Database(str(config.DB_PATH))
+    log_id = db.log_adhoc_start("dub_cues")
 
     def _set(**kw):
         with _adhoc_sync_jobs_lock:
             if job_id in _adhoc_sync_jobs:
                 _adhoc_sync_jobs[job_id].update(kw)
+                db.log_adhoc_update(log_id, _adhoc_sync_jobs[job_id]["status"], _adhoc_sync_jobs[job_id]["log"], _adhoc_sync_jobs[job_id].get("error", ""))
     def _log(msg, level="info"):
         with _adhoc_sync_jobs_lock:
             if job_id in _adhoc_sync_jobs:
                 _adhoc_sync_jobs[job_id]["log"].append({"timestamp": __import__("time").time(), "level": level, "message": msg})
+                db.log_adhoc_update(log_id, _adhoc_sync_jobs[job_id]["status"], _adhoc_sync_jobs[job_id]["log"], _adhoc_sync_jobs[job_id].get("error", ""))
 
     try:
         vpm = VoiceProfileManager(str(config.VOICES_DIR))
-        profile = vpm.load(req.voice)
-        if not profile:
-            _set(status="failed", error=f"Voice '{req.voice}' not found"); return
-        profile.language = req.lang_code
 
         cues = req.cues
         if not cues:
@@ -493,8 +609,9 @@ def _run_dub_cues(job_id: str, req: DubCuesRequest):
         # general fix, not just for cue 1. Tune DUB_WARMUP_WORD to taste.
         per_cue   = bool(getattr(config, "DUB_WARMUP_PER_CUE", False))
         warm_word = (getattr(config, "DUB_WARMUP_WORD", "Bon.") or "").strip()
-        segments = []   # {cue, sub, text, path, start, dur}
+        segments_by_voice = {}
         for i, c in enumerate(cues):
+            voice_name = c.get("voice") or req.voice
             text = (c.get("translated") or "").strip()
             start = float(c.get("start", 0)); end = float(c.get("end", 0))
             nxt = float(cues[i + 1]["start"]) if i + 1 < len(cues) else end
@@ -520,17 +637,32 @@ def _run_dub_cues(job_id: str, req: DubCuesRequest):
                     elif warm and i == 0:                     # else just cue 1 (old behaviour)
                         seg["text"] = f"{warm} {part}"
                         seg["strip_warmup"] = warm
-                segments.append(seg)
+                segments_by_voice.setdefault(voice_name, []).append(seg)
 
         _set(message="Generating voiceover (per cue)…")
-        sentences = [s["text"] for s in segments]
-        outpaths  = [s["path"] for s in segments]
-        script = synth.build_synth_script(profile=profile, sentences=sentences, output_paths=outpaths, skip_indices=set())
-        r = subprocess.run([synth.synth_python(profile), "-c", script], capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=1800, env=synth.synth_env(profile))
-        made = sum(1 for s in segments if Path(s["path"]).exists())
-        if made < len([s for s in segments if s["cue"] >= 0]):
-            _set(status="failed", error="Synthesis failed.\n" + (r.stdout or "")[-300:] + "\n" + (r.stderr or "")[-400:]); return
+        
+        all_segments = []
+        for voice_name, voice_segments in segments_by_voice.items():
+            profile = vpm.load(voice_name)
+            if not profile:
+                _set(status="failed", error=f"Voice '{voice_name}' not found"); return
+            profile.language = req.lang_code
+            
+            sentences = [s["text"] for s in voice_segments]
+            outpaths  = [s["path"] for s in voice_segments]
+            script = synth.build_synth_script(profile=profile, sentences=sentences, output_paths=outpaths, skip_indices=set())
+            
+            import subprocess
+            r = subprocess.run([synth.synth_python(profile), "-c", script], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=1800, env=synth.synth_env(profile))
+            made = sum(1 for s in voice_segments if Path(s["path"]).exists())
+            if made < len([s for s in voice_segments if s["cue"] >= 0]):
+                _set(status="failed", error=f"Synthesis failed for voice {voice_name}.\n" + (r.stdout or "")[-300:] + "\n" + (r.stderr or "")[-400:]); return
+            
+            all_segments.extend(voice_segments)
+
+        # Sort segments back into original chronological order
+        segments = sorted(all_segments, key=lambda s: (s["cue"], s["sub"]))
 
         # Clean each clip's onset, then level for consistent loudness:
         #  • the first clip: strip the prepended warm-up lead (by pause), and
@@ -564,30 +696,65 @@ def _run_dub_cues(job_id: str, req: DubCuesRequest):
         # the two halves with the leftover slot time as a real pause between them.
         placements = []
         real = [s for s in segments if s["cue"] >= 0 and Path(s["path"]).exists()]
-        # group by cue
         by_cue = {}
         for s in real:
             by_cue.setdefault(s["cue"], []).append(s)
-        for i, group in by_cue.items():
-            group.sort(key=lambda s: s["sub"])
-            start = group[0]["start"]; nxt = group[0]["next"]; slot = max(0.05, nxt - start)
-            durs = []
-            for s in group:
-                try:
-                    y, sr = sf.read(s["path"]); durs.append((len(y) / sr) if sr else 0.0)
-                except Exception:
-                    durs.append(0.0)
-            if len(group) == 1:
-                placements.append({"path": group[0]["path"], "start": start})
-            else:
-                gap = max(0.15, (slot - sum(durs) - 0.08) / max(1, len(group) - 1))
-                t = start
-                for s, d in zip(group, durs):
-                    placements.append({"path": s["path"], "start": round(t, 3)})
-                    t += d + gap
+            
+        updated_cues = None
+        if getattr(req, "repack_timings", False):
+            updated_cues = []
+            current_time = 0.0
+            for i in range(len(cues)):
+                c = dict(cues[i])
+                c["start"] = round(current_time, 3)
+                if i in by_cue:
+                    group = by_cue[i]
+                    group.sort(key=lambda s: s["sub"])
+                    durs = []
+                    for s in group:
+                        try:
+                            y, sr = sf.read(s["path"]); durs.append((len(y) / sr) if sr else 0.0)
+                        except Exception:
+                            durs.append(0.0)
+                            
+                    if len(group) == 1:
+                        placements.append({"path": group[0]["path"], "start": round(current_time, 3)})
+                        current_time += durs[0]
+                    else:
+                        gap = 0.25  # natural gap between split sentences
+                        for s, d in zip(group, durs):
+                            placements.append({"path": s["path"], "start": round(current_time, 3)})
+                            current_time += d + gap
+                        current_time -= gap
+                c["end"] = round(current_time, 3)
+                updated_cues.append(c)
+                current_time += 0.4  # minimum pause between different cues (paragraphs/speakers)
+        else:
+            for i, group in by_cue.items():
+                group.sort(key=lambda s: s["sub"])
+                start = group[0]["start"]; nxt = group[0]["next"]; slot = max(0.05, nxt - start)
+                durs = []
+                for s in group:
+                    try:
+                        y, sr = sf.read(s["path"]); durs.append((len(y) / sr) if sr else 0.0)
+                    except Exception:
+                        durs.append(0.0)
+                if len(group) == 1:
+                    placements.append({"path": group[0]["path"], "start": start})
+                else:
+                    gap = max(0.15, (slot - sum(durs) - 0.08) / max(1, len(group) - 1))
+                    t = start
+                    for s, d in zip(group, durs):
+                        placements.append({"path": s["path"], "start": round(t, 3)})
+                        t += d + gap
+        
         placements.sort(key=lambda p: p["start"])
 
-        total_duration = max(float(c.get("end", 0)) for c in cues) + 2.0
+        if getattr(req, "repack_timings", False) and updated_cues:
+            total_duration = max(float(c.get("end", 0)) for c in updated_cues) + 2.0
+        else:
+            total_duration = max(float(c.get("end", 0)) for c in cues) + 2.0
+            
         _set(message="Assembling track…")
         raw = str(work / "synced_raw.wav")
         if not aligner.assemble_track(placements, total_duration, raw, on_log=_log):
@@ -597,21 +764,177 @@ def _run_dub_cues(job_id: str, req: DubCuesRequest):
         final = str(work / "synced_final.wav")
         if not master(raw, final, on_log=_log):
             final = raw
-        _set(status="done", message="Dub complete!", synced_audio_url=_files_url(Path(final)))
-        _log("▶ Per-cue dub complete.", "success")
+        final_url = _files_url(Path(final))
+        
+        if getattr(req, "repack_timings", False):
+            _set(status="done", message="Done", synced_audio_url=final_url, updated_cues=updated_cues)
+        else:
+            _set(status="done", message="Done", synced_audio_url=final_url)
+            
+        _log(f"Dub complete in {time.time() - start_time:.1f}s")
     except Exception as exc:
         _set(status="failed", error=str(exc))
         _log(f"Fatal error: {exc}", "error")
+    finally:
+        db.close()
 
 
-@router.post("/speech/dub-cues", response_model=AdhocSyncJob)
-def dub_cues(req: DubCuesRequest):
+@router.post("/speech/dub-cues", response_model=AdhocSyncJob, status_code=202)
+def dub_cues(req: DubCuesRequest, db: Database = Depends(get_db)):
     import uuid as _uuid
     job_id = str(_uuid.uuid4())
     with _adhoc_sync_jobs_lock:
         _adhoc_sync_jobs[job_id] = {"job_id": job_id, "status": "running", "message": "Queued …",
                                     "synced_audio_url": "", "log": [], "error": ""}
     threading.Thread(target=_run_dub_cues, args=(job_id, req), daemon=True).start()
+    return AdhocSyncJob(**_adhoc_sync_jobs[job_id])
+
+
+# ── Incremental redub — re-synthesise ONE cue, then cheaply reassemble ────────
+# Editing a line should redub only THAT clip (1 TTS call) and rebuild the final
+# track (just audio placement, no TTS) — never re-voice every cue. This is what
+# makes the editor usable on hours of audio.
+
+def _clean_cue_clip(path: str, strip_warmup: str, comf: float, _log) -> None:
+    """Apply the same onset cleanups as the full dub to a single clip."""
+    import soundfile as sf
+    from speech import aligner
+    from speech.wordsplit import strip_lead_segment
+    try:
+        y, sr = sf.read(path)
+        if getattr(y, "ndim", 1) > 1:
+            y = y.mean(axis=1)
+        if strip_warmup:
+            y2, stripped = strip_lead_segment(y, sr, on_log=_log)
+            if stripped < 0.15:
+                est = len(strip_warmup) / max(1.0, comf) + 0.15
+                cut = int(min(est, len(y) / sr * 0.6) * sr)
+                y2 = y[cut:]
+            y = y2
+        y = aligner.strip_leading_hum(y, sr)
+        y = aligner.trim_onset_wobble(y, sr)
+        sf.write(path, y, sr)
+    except Exception as exc:
+        _log(f"clean failed: {exc}", "warning")
+    _level_clip(path)
+
+
+def _assemble_project_dub(cues: list, work: Path, _log) -> str | None:
+    """Reassemble the final track from each cue's existing clip (cue_NNNN_0.wav)
+    placed at its start, then master. Returns the /files URL or None."""
+    import soundfile as sf
+    from speech import aligner
+    from speech.master import master
+    placements = []
+    for i, c in enumerate(cues):
+        p = work / f"cue_{i:04d}_0.wav"
+        if p.exists():
+            placements.append({"path": str(p), "start": float(c.get("start", 0))})
+    if not placements:
+        return None
+    total = max(float(c.get("end", 0)) for c in cues) + 2.0
+    raw   = str(work / "synced_raw.wav")
+    final = str(work / "synced_final.wav")
+    if not aligner.assemble_track(placements, total, raw, on_log=_log):
+        return None
+    if not master(raw, final, on_log=_log):
+        final = raw
+    return _files_url(Path(final))
+
+
+def _run_redub_cue(job_id: str, req: "RedubCueRequest"):
+    from tts import synth
+    from tts.voice_profile import VoiceProfileManager
+    from speech import cps
+    from pathlib import Path as _P
+    import time
+    import config
+    from database import Database
+    start_time = time.time()
+    db = Database(str(config.DB_PATH))
+    import subprocess
+    log_id = db.log_adhoc_start("redub_cue")
+
+    def _set(**kw):
+        with _adhoc_sync_jobs_lock:
+            if job_id in _adhoc_sync_jobs:
+                _adhoc_sync_jobs[job_id].update(kw)
+                db.log_adhoc_update(log_id, _adhoc_sync_jobs[job_id]["status"], _adhoc_sync_jobs[job_id]["log"], _adhoc_sync_jobs[job_id].get("error", ""))
+
+    def _log(msg, level="info"):
+        with _adhoc_sync_jobs_lock:
+            if job_id in _adhoc_sync_jobs:
+                _adhoc_sync_jobs[job_id]["log"].append(
+                    {"timestamp": __import__("time").time(), "level": level, "message": msg})
+                db.log_adhoc_update(log_id, _adhoc_sync_jobs[job_id]["status"], _adhoc_sync_jobs[job_id]["log"], _adhoc_sync_jobs[job_id].get("error", ""))
+
+    try:
+        i = int(req.index)
+        if i < 0 or i >= len(req.cues):
+            _set(status="failed", error="Bad cue index"); return
+        voice_name = req.cues[i].get("voice") or req.voice
+        profile = VoiceProfileManager(str(config.VOICES_DIR)).load(voice_name)
+        if not profile:
+            _set(status="failed", error=f"Voice '{voice_name}' not found"); return
+        profile.language = req.lang_code
+
+        work = Path(config.OUTPUT_DIR) / str(req.project_id) / "dub" / req.lang_code
+        work.mkdir(parents=True, exist_ok=True)
+        comf = cps.comfortable_cps(req.lang_code)
+
+        text = (req.cues[i].get("translated") or "").strip()
+        if not text:
+            _set(status="failed", error="Cue has no text to dub"); return
+        warm = config.DUB_WARMUP_WORD if (getattr(config, "DUB_WARMUP_PER_CUE", False)
+                                          and getattr(config, "DUB_WARMUP_WORD", "")) else ""
+        gen_text = f"{warm} {text}" if warm else text
+        path = work / f"cue_{i:04d}_0.wav"
+        # drop any legacy split half for this cue
+        old1 = work / f"cue_{i:04d}_1.wav"
+        if old1.exists():
+            try: old1.unlink()
+            except OSError: pass
+
+        _set(message=f"Re-voicing cue {i + 1}…")
+        script = synth.build_synth_script(profile=profile, sentences=[gen_text],
+                                          output_paths=[str(path)], skip_indices=set())
+        r = subprocess.run([synth.synth_python(profile), "-c", script], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=600, env=synth.synth_env(profile))
+        if not path.exists():
+            _set(status="failed", error="Synthesis failed.\n" + (r.stderr or "")[-400:]); return
+
+        _set(message="Cleaning clip…")
+        _clean_cue_clip(str(path), warm, comf, _log)
+
+        _set(message="Reassembling track…")
+        url = _assemble_project_dub(req.cues, work, _log)
+        if not url:
+            _set(status="failed", error="Reassembly failed"); return
+        _set(status="done", message="Cue redubbed!", synced_audio_url=url)
+        _log(f"▶ Redubbed cue {i + 1}.", "success")
+    except Exception as exc:
+        _set(status="failed", error=str(exc))
+        _log(f"Fatal error: {exc}", "error")
+    finally:
+        db.close()
+
+
+class RedubCueRequest(BaseModel):
+    project_id: int
+    voice:      str
+    lang_code:  str = "French"
+    cues:       List[dict]      # all cues (for timing + reassembly)
+    index:      int             # which cue to re-voice
+
+
+@router.post("/speech/redub-cue", response_model=AdhocSyncJob)
+def redub_cue(req: RedubCueRequest):
+    import uuid as _uuid
+    job_id = str(_uuid.uuid4())
+    with _adhoc_sync_jobs_lock:
+        _adhoc_sync_jobs[job_id] = {"job_id": job_id, "status": "running", "message": "Queued …",
+                                    "synced_audio_url": "", "log": [], "error": ""}
+    threading.Thread(target=_run_redub_cue, args=(job_id, req), daemon=True).start()
     return AdhocSyncJob(**_adhoc_sync_jobs[job_id])
 
 
@@ -632,9 +955,12 @@ class RefineCueRequest(BaseModel):
 def refine_cue(req: RefineCueRequest, db: Database = Depends(get_db)):
     from ai import translator
     from speech import cps
+    import time
+    start_time = time.time()
 
     dur = float(req.end) - float(req.start)
     if dur <= 0:
+        db.log_adhoc_activity("refine_cue", "failed", time.time() - start_time, [], "Cue has no positive duration")
         raise HTTPException(400, "Cue has no positive duration")
 
     provider = db.get_setting("ai_provider_translate", "nvidia")
@@ -669,18 +995,141 @@ def refine_cue(req: RefineCueRequest, db: Database = Depends(get_db)):
                 break
             target = int(target * 0.9)
     except Exception as exc:
+        db.log_adhoc_activity("refine_cue", "failed", time.time() - start_time, [], f"Couldn't reach the translation model: {exc}")
         raise HTTPException(503, f"Couldn't reach the translation model: {exc}")
 
     if not got_response:
+        db.log_adhoc_activity("refine_cue", "failed", time.time() - start_time, [], "No response from the translation model")
         raise HTTPException(503, "No response from the translation model")
 
     changed = best != original
+    log_msg = f"Refined cue from {len(original)} chars to {len(best)} chars" if changed else "No change needed"
+    db.log_adhoc_activity("refine_cue", "done", time.time() - start_time, [{"timestamp": time.time(), "level": "info", "message": log_msg}])
+    
     return {
         "translated": best,
         "cps":        round(cps.cps_of(best, dur), 1) if dur > 0 else 0.0,
         "rushed":     bool(cps.is_rushed(best, dur, req.lang_code)),
         "changed":    changed,
     }
+
+
+# ── AI Refine — rewrite the whole narration script (Brief/Standard/Detailed) ──
+# Refines every line at once so the script reads like a polished recap, not the
+# raw transcript. Keeps the line COUNT and order so it stays time-synced. Works
+# on whichever field is being dubbed (the translation by default).
+
+class RefineScriptRequest(BaseModel):
+    lines:        List[str]          # the narration lines to refine, in order
+    durations:    List[float] = []   # each line's time slot (s) — for CPS fitting
+    level:        str = "standard"   # brief | standard | detailed
+    instructions: str = ""           # optional free-form guidance
+    lang:         str = "French"     # language of the lines
+
+
+_LEVEL_DESC = {
+    "brief":    "BRIEF — tighten each line to its punchy essence; cut filler, keep the impact. A touch SHORTER than the input.",
+    "standard": "STANDARD — clear, natural, well-written narration. About the SAME length as the input.",
+    "detailed": "DETAILED — richer and more vivid; add a little descriptive colour. A touch LONGER, but still concise.",
+}
+
+
+@router.post("/speech/refine-script")
+def refine_script(req: RefineScriptRequest, db: Database = Depends(get_db)):
+    from ai import translator
+    from speech import cps
+    import time
+    start_time = time.time()
+
+    lines = [(s or "").strip() for s in req.lines]
+    n = len(lines)
+    if n == 0:
+        db.log_adhoc_activity("refine_script", "failed", time.time() - start_time, [], "No lines to refine")
+        raise HTTPException(400, "No lines to refine")
+
+    durs = list(req.durations) if len(req.durations) == n else [0.0] * n
+    # aim_chars = how many characters fit each line's time slot at a comfortable
+    # speaking rate. The refine MUST respect this or lines come out at 50+ CPS.
+    aims = [cps.target_chars(d, req.lang) if d > 0 else max(1, int(len(l) * 0.95))
+            for d, l in zip(durs, lines)]
+
+    provider = db.get_setting("ai_provider_translate", "nvidia")
+    api_key  = db.get_setting("nvidia_api_key", "")
+    lm_model = db.get_setting("lm_studio_model", "")
+    try:    ctx = int(db.get_setting("lm_studio_context_length", "32768"))
+    except (TypeError, ValueError): ctx = 32768
+
+    level = (req.level or "standard").lower()
+    level_desc = _LEVEL_DESC.get(level, _LEVEL_DESC["standard"])
+    extra = (req.instructions or "").strip()
+    items = [{"text": l, "aim_chars": a} for l, a in zip(lines, aims)]
+
+    prompt = (
+        f"You are a professional {req.lang} video-narration writer polishing a recap/voiceover script.\n\n"
+        f"LEVEL: {level_desc}\n"
+        + (f"EXTRA INSTRUCTIONS: {extra}\n" if extra else "")
+        + f"\nThis is TIME-SYNCED dubbing. Each line has an \"aim_chars\" = the most characters that "
+        f"fit its on-screen time at a natural speaking rate.\n"
+        f"Rewrite EACH of the {n} {req.lang} lines so the script reads like a crafted recap — more "
+        f"engaging than the raw transcript — while:\n"
+        f"  • STAYING AT OR UNDER each line's aim_chars. A line longer than aim_chars gets sped up and "
+        f"sounds robotic — this is the #1 rule. Brief = well under; Detailed = close to but not over.\n"
+        f"  • Preserving the meaning, facts and story ORDER. Do NOT merge, split, add, or drop lines.\n"
+        f"  • Writing natural, fluent {req.lang} (no English, no notes).\n"
+        f"Return EXACTLY {n} lines.\n\n"
+        f"Return ONLY a JSON array of exactly {n} {req.lang} strings. No markdown, no code fences, no notes.\n\n"
+        f"Input ({n} lines, each with its aim_chars):\n{json.dumps(items, ensure_ascii=False, indent=2)}"
+    )
+
+    try:
+        resp = translator.call_provider(
+            prompt, provider=provider, api_key=api_key,
+            lm_model=lm_model, max_tokens=4096, context_length=ctx,
+        )
+    except Exception as exc:
+        db.log_adhoc_activity("refine_script", "failed", time.time() - start_time, [], f"Couldn't reach the AI model: {exc}")
+        raise HTTPException(503, f"Couldn't reach the AI model: {exc}")
+
+    txt = translator.strip_markdown_fences(translator.strip_thinking_blocks(resp)).strip()
+    try:
+        arr = json.loads(translator.extract_json_array(txt))
+    except Exception:
+        db.log_adhoc_activity("refine_script", "failed", time.time() - start_time, [], "AI returned an unparseable response")
+        raise HTTPException(502, "AI returned an unparseable response — try again.")
+    arr = [str(x).strip() for x in arr if str(x).strip()]
+    if len(arr) < n:
+        arr += lines[len(arr):]          # fall back to originals for any missing
+    elif len(arr) > n:
+        arr = arr[:n]
+
+    # CPS-fit pass: any refined line still too dense for its slot gets shortened
+    # to fit (so we never hand back a 50-CPS line). Runs concurrently.
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _fit(i):
+        d, t = durs[i], arr[i]
+        if d <= 0 or not cps.is_rushed(t, d, req.lang):
+            return t
+        target = cps.target_chars(d, req.lang)
+        for _ in range(2):
+            cand = (translator.shorten_line(t, t, target, req.lang, provider=provider,
+                    api_key=api_key, lm_studio_model=lm_model, context_length=ctx,
+                    on_log=lambda *a, **k: None) or "").strip()
+            if cand and cps.cps_of(cand, d) < cps.cps_of(t, d):
+                t = cand
+            if not cps.is_rushed(t, d, req.lang):
+                break
+            target = int(target * 0.9)
+        return t
+
+    rushed = [i for i in range(n) if durs[i] > 0 and cps.is_rushed(arr[i], durs[i], req.lang)]
+    if rushed:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for i, fixed in zip(rushed, ex.map(_fit, rushed)):
+                arr[i] = fixed
+
+    db.log_adhoc_activity("refine_script", "done", time.time() - start_time, [{"timestamp": time.time(), "level": "info", "message": f"Refined {n} lines"}])
+    return {"lines": arr}
 
 
 # ── Per-project Dub Studio session (persisted on disk) ───────────────────────
@@ -699,6 +1148,8 @@ def list_voiceover_projects(db: Database = Depends(get_db)):
     out = []
     for row in db.list_projects():
         pid = row["id"]
+        if db.get_setting(f"project_kind_{pid}", "") == "video_refine":
+            continue                          # Video Refine projects live in their own section
         sess = {}
         p = _session_path(pid)
         if p.exists():
@@ -764,6 +1215,9 @@ class DubExportRequest(BaseModel):
 
 @router.post("/speech/export/{project_id}")
 def export_dub(project_id: int, body: DubExportRequest, db: Database = Depends(get_db)):
+    import time
+    start_time = time.time()
+    
     proj = db.get_project(project_id)
     if not proj:
         raise HTTPException(404, f"Project {project_id} not found")
@@ -783,15 +1237,20 @@ def export_dub(project_id: int, body: DubExportRequest, db: Database = Depends(g
             r = _sp.run(["ffmpeg", "-y", "-i", str(audio), "-c:a", "libmp3lame",
                          "-b:a", "192k", str(out)], capture_output=True, text=True, timeout=600)
         except Exception as exc:
+            db.log_adhoc_activity("export_dub", "failed", time.time() - start_time, [], f"ffmpeg error: {exc}", proj.get("name", ""))
             raise HTTPException(500, f"ffmpeg error: {exc}")
         if r.returncode != 0 or not out.exists():
+            db.log_adhoc_activity("export_dub", "failed", time.time() - start_time, [], f"Audio export failed: {(r.stderr or '')[-400:]}", proj.get("name", ""))
             raise HTTPException(500, f"Audio export failed: {(r.stderr or '')[-400:]}")
     else:
         if not body.source_path or not Path(body.source_path).exists():
+            db.log_adhoc_activity("export_dub", "failed", time.time() - start_time, [], "Original video not found", proj.get("name", ""))
             raise HTTPException(400, "Original video not found — needed for an MP4 export.")
         from speech.mux import mux
         out = exports / f"{base}.mp4"
         if not mux(body.source_path, str(audio), str(out)):
+            db.log_adhoc_activity("export_dub", "failed", time.time() - start_time, [], "Video export (mux) failed", proj.get("name", ""))
             raise HTTPException(500, "Video export (mux) failed — see logs.")
 
+    db.log_adhoc_activity("export_dub", "done", time.time() - start_time, [{"timestamp": time.time(), "level": "success", "message": f"Exported {body.fmt} to {out.name}"}], "", proj.get("name", ""))
     return {"ok": True, "url": _files_url(out), "path": str(out), "filename": out.name}

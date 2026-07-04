@@ -14,7 +14,7 @@ import { useNotify } from "../store/notify"
 import { colors, fonts, radius, status as stStatus, logColors } from "../theme"
 import Button from "../components/Button"
 
-const FILTERS = ["all", "failed", "done", "running"]
+const FILTERS = ["all", "dub_studio", "failed", "done", "running"]
 const KNOWN_STATUS = new Set(["pending", "running", "done", "failed", "skipped", "outdated"])
 
 export default function Logs() {
@@ -45,7 +45,9 @@ export default function Logs() {
     catch (err) { notify({ severity: "error", message: err.message }) }
   }
 
-  const shown = filter === "all" ? rows : rows.filter(r => r.status === filter)
+  const shown = filter === "all" ? rows
+    : filter === "dub_studio" ? rows.filter(r => r.episode_id === 0 || r.stage.includes("adhoc") || r.stage.includes("dub") || r.stage.includes("refine"))
+    : rows.filter(r => r.status === filter)
   const fmtTime = (t) => t ? new Date(t * 1000).toLocaleString() : "—"
   const fmtDur  = (d) => d == null ? "—" : d < 60 ? `${d.toFixed(1)}s` : `${Math.floor(d / 60)}m ${Math.round(d % 60)}s`
 
@@ -60,7 +62,11 @@ export default function Logs() {
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <select value={filter} onChange={e => setFilter(e.target.value)}
             style={{ background: colors.panel2, color: colors.text, border: `1px solid ${colors.border}`, borderRadius: radius.sm, padding: "6px 9px", fontSize: fonts.sm }}>
-            {FILTERS.map(f => <option key={f} value={f}>{f === "all" ? "All statuses" : f}</option>)}
+            {FILTERS.map(f => (
+              <option key={f} value={f}>
+                {f === "all" ? "All entries" : f === "dub_studio" ? "Dub Studio / Adhoc" : f}
+              </option>
+            ))}
           </select>
           <Button variant="secondary" size="sm" onClick={load}>Reload</Button>
           <Button variant="danger" size="sm" onClick={onClear}>Clear all</Button>
@@ -68,69 +74,41 @@ export default function Logs() {
       </div>
 
       <div style={{ flex: 1, overflow: "auto", padding: "12px 24px" }}>
-        {loading && <Center>Loading…</Center>}
         {error && !loading && <Center><span style={{ color: colors.error }}>{error}</span></Center>}
-        {!loading && !error && shown.length === 0 && <Center>No log entries{filter !== "all" ? ` with status “${filter}”` : ""} yet.</Center>}
-
-        {!loading && !error && shown.length > 0 && (
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: fonts.sm }}>
-            <thead>
-              <tr>{["When", "Project · Episode", "Stage", "Status", "Duration"].map(h =>
-                <th key={h} style={th}>{h}</th>)}</tr>
-            </thead>
-            <tbody>
-              {shown.map(r => {
-                const sc = stStatus.color[r.status] || colors.muted
-                const expandable = !!((r.log && r.log.length) || (r.error && r.error.trim()))
-                return (
-                  <FragmentRow key={r.id} r={r} sc={sc} expandable={expandable}
-                    open={open === r.id} onToggle={() => setOpen(open === r.id ? null : r.id)}
-                    fmtTime={fmtTime} fmtDur={fmtDur} />
-                )
-              })}
-            </tbody>
-          </table>
-        )}
+        <div style={{ flex: 1, background: "#0a0a0a", borderRadius: radius.md, border: `1px solid ${colors.border}`, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ flex: 1, overflowY: "auto", padding: 16, fontFamily: fonts.mono, fontSize: fonts.sm, color: "#d4d4d4", lineHeight: 1.6 }}>
+          {loading && rows.length === 0 ? <Center>Loading...</Center> : rows.length === 0 ? <Center>No log entries yet.</Center> : (
+            rows.map((r, idx) => (
+              <div key={r.id || idx} style={{ marginBottom: 24 }}>
+                <div style={{ color: "#666", marginBottom: 6, fontSize: fonts.xs }}>
+                  <span style={{ color: "#888" }}>[{fmtTime(r.started_at)}]</span>{" "}
+                  <span style={{ color: "#569cd6" }}>[{r.stage}]</span>{" "}
+                  <span>{r.project_name}{r.episode_id !== 0 ? ` · Ep ${r.episode_id}` : ""}</span>{" "}
+                  <span style={{ color: r.status === "failed" ? "#f48771" : r.status === "done" ? "#89d185" : "#cca700" }}>[{r.status.toUpperCase()}]</span>{" "}
+                  <span>({fmtDur(r.duration_secs)})</span>
+                </div>
+                <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+                  {r.log && r.log.length > 0 ? (
+                    r.log.map((ln, i) => {
+                      const msg = typeof ln === "string" ? ln : (ln.message || JSON.stringify(ln));
+                      return <div key={i} style={{ color: ln.level === "error" ? "#f48771" : ln.level === "warning" ? "#cca700" : "inherit" }}>{msg}</div>;
+                    })
+                  ) : (
+                    <div style={{ color: r.status === "failed" ? "#f48771" : "#666" }}>
+                      {r.error || "No detailed logs available."}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+        </div>
       </div>
     </div>
   )
 }
 
-function FragmentRow({ r, sc, expandable, open, onToggle, fmtTime, fmtDur }) {
-  return (
-    <>
-      <tr onClick={expandable ? onToggle : undefined} style={{ cursor: expandable ? "pointer" : "default" }}>
-        <td style={td}>{fmtTime(r.started_at)}</td>
-        <td style={td}>
-          <span style={{ color: colors.muted }}>{r.project_name}</span>
-          <span style={{ color: colors.textDim }}> · {r.episode_title || `#${r.episode_id}`}</span>
-        </td>
-        <td style={td}>{r.stage}</td>
-        <td style={td}>
-          {KNOWN_STATUS.has(r.status)
-            ? <span style={{ color: sc, border: `1px solid ${sc}`, borderRadius: radius.full, padding: "1px 8px", fontSize: fonts.xs }}>{r.status}</span>
-            : <span style={{ color: colors.textDim, fontSize: fonts.xs }}>{r.status}</span>}
-        </td>
-        <td style={td}>{fmtDur(r.duration_secs)}{expandable && <span style={{ color: colors.muted, marginLeft: 8 }}>{open ? "▾" : "▸"}</span>}</td>
-      </tr>
-      {open && expandable && (
-        <tr><td colSpan={5} style={{ ...td, background: colors.panel2, padding: 0 }}>
-          <div style={{ maxHeight: 360, overflowY: "auto", padding: "10px 12px", fontFamily: fonts.mono, fontSize: fonts.xs, lineHeight: 1.6 }}>
-            {r.log && r.log.length
-              ? r.log.map((ln, i) => (
-                  <div key={i} style={{ color: logColors[ln.level] || colors.text, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{ln.message}</div>
-                ))
-              : <div style={{ color: colors.error, whiteSpace: "pre-wrap" }}>{r.error}</div>}
-          </div>
-        </td></tr>
-      )}
-    </>
-  )
-}
-
 function Center({ children }) {
-  return <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "60%", color: colors.muted, fontSize: fonts.base, textAlign: "center" }}>{children}</div>
+  return <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: colors.muted, fontSize: fonts.base, textAlign: "center" }}>{children}</div>
 }
-
-const th = { textAlign: "left", color: colors.muted, fontWeight: fonts.bold, fontSize: fonts.xs, letterSpacing: "0.05em", padding: "7px 8px", borderBottom: `1px solid ${colors.border}`, position: "sticky", top: 0, background: colors.bg }
-const td = { padding: "7px 8px", borderBottom: `1px solid ${colors.border}`, color: colors.textDim, verticalAlign: "top" }

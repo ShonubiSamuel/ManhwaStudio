@@ -22,14 +22,20 @@ export function getAdhocTranslateStatus(jobId) {
   return get(`/speech/adhoc-translate/${jobId}`)
 }
 
+/** Translate EXISTING cues to a language (no re-transcribe). Same job shape as
+ *  adhoc-translate, so poll with getAdhocTranslateStatus. */
+export function startTranslateCues(cues, langCode) {
+  return post("/speech/translate-cues", { cues, lang_code: langCode })
+}
+
 export function startAdhocSync(audioUrl, cues, langCode = "fr", projectId = null, leadDummy = null) {
   return post("/speech/adhoc-sync", { audio_url: audioUrl, cues, lang_code: langCode, project_id: projectId, lead_dummy: leadDummy })
 }
 
 /** Per-cue dubbing: synthesize each line separately, place, master. One call →
  *  poll with getAdhocSyncStatus. Replaces the TTS-read + split flow. */
-export function startDubCues(cues, voice, langCode = "French", projectId = null) {
-  return post("/speech/dub-cues", { cues, voice, lang_code: langCode, project_id: projectId })
+export function startDubCues(cues, voice, langCode = "French", projectId = null, repackTimings = false) {
+  return post("/speech/dub-cues", { cues, voice, lang_code: langCode, project_id: projectId, repack_timings: repackTimings })
 }
 
 export function getAdhocSyncStatus(jobId) {
@@ -47,6 +53,18 @@ export function refineCue({ text, translated, start, end, langCode = "fr" }) {
 /** The Voiceover landing list — projects + session metadata. */
 export function listVoiceoverProjects() {
   return get("/voiceover/projects")
+}
+
+/** Redub ONE cue (re-synthesize just that clip + reassemble the final track).
+ *  Watch progress via getAdhocSyncStatus(job_id). @returns the started job. */
+export function startRedubCue(projectId, voice, langCode, cues, index) {
+  return post("/speech/redub-cue", { project_id: projectId, voice, lang_code: langCode, cues, index })
+}
+
+/** AI Refine: rewrite the whole narration script at a level (brief|standard|detailed).
+ *  @returns {Promise<{lines: string[]}>} refined lines, same count/order. */
+export function refineScript(lines, { durations = [], level = "standard", instructions = "", lang = "French" } = {}) {
+  return post("/speech/refine-script", { lines, durations, level, instructions, lang })
 }
 
 /** Load a project's saved Dub Studio session ({} if none yet). */

@@ -10,23 +10,51 @@ import { NotificationsProvider, Toaster } from "./store/notify"
 import { colors } from "./theme"
 import Sidebar    from "./components/Sidebar"
 import Voiceover  from "./pages/Voiceover"
+import VideoRefine from "./pages/VideoRefine"
+import Voices     from "./pages/Voices"
 import ComingSoon from "./pages/ComingSoon"
 import Settings   from "./pages/Settings"
 import Logs       from "./pages/Logs"
 
 function PageRouter() {
   const { state } = useApp()
+  const p = state.page
 
-  switch (state.page) {
-    case PAGES.VOICEOVER:     return <Voiceover />
-    case PAGES.TRANSCRIPTION: return <ComingSoon title="Transcription" icon="≣" desc="Upload audio or video and get an accurate, speaker-aware transcript you can edit and export (SRT / TXT)." />
-    case PAGES.SUBTITLE:      return <ComingSoon title="Subtitle" icon="▭" desc="Generate, translate, and style subtitles, then export SRT / VTT or burn them into the video." />
-    case PAGES.REALTIME:      return <ComingSoon title="Real-Time" icon="◉" desc="Live transcription and voice for meetings and streams." />
-    case PAGES.VOICES:        return <ComingSoon title="Voices" icon="♪" desc="Browse the voice library by gender, language, and expression, favourite voices, and clone your own." />
-    case PAGES.SETTINGS:      return <Settings />
-    case PAGES.LOGS:          return <Logs />
-    default:                  return <Voiceover />
-  }
+  // Render all pages but hide the inactive ones to preserve their state!
+  return (
+    <>
+      <div style={{ display: p === PAGES.VOICEOVER ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
+        <Voiceover />
+      </div>
+      <div style={{ display: p === PAGES.VIDEO_REFINE ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
+        <VideoRefine />
+      </div>
+      <div style={{ display: p === PAGES.TRANSCRIPTION ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
+        <ComingSoon title="Transcription" icon="≣" desc="Upload audio or video and get an accurate, speaker-aware transcript you can edit and export (SRT / TXT)." />
+      </div>
+      <div style={{ display: p === PAGES.SUBTITLE ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
+        <ComingSoon title="Subtitle" icon="▭" desc="Generate, translate, and style subtitles, then export SRT / VTT or burn them into the video." />
+      </div>
+      <div style={{ display: p === PAGES.REALTIME ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
+        <ComingSoon title="Real-Time" icon="◉" desc="Live transcription and voice for meetings and streams." />
+      </div>
+      <div style={{ display: p === PAGES.VOICES ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
+        <Voices />
+      </div>
+      <div style={{ display: p === PAGES.SETTINGS ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
+        <Settings />
+      </div>
+      <div style={{ display: p === PAGES.LOGS ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
+        <Logs />
+      </div>
+      {/* Fallback rendering for undefined pages defaults to Voiceover */}
+      {(!Object.values(PAGES).includes(p)) && (
+        <div style={{ display: "flex", flex: 1, flexDirection: "column", overflow: "hidden" }}>
+          <Voiceover />
+        </div>
+      )}
+    </>
+  )
 }
 
 function AppShell() {

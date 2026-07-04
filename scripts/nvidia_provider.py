@@ -54,6 +54,12 @@ def call_text(
     Returns the full assembled response string.
     Raises openai.APIError on non-retryable failures.
     """
+    import time
+    import logging
+    logger = logging.getLogger(__name__)
+    start_time = time.time()
+    logger.info(f"Requesting text model {config.NVIDIA_MODEL} (prompt: {len(prompt)} chars)...")
+
     from openai import OpenAI
 
     client = OpenAI(
@@ -62,19 +68,27 @@ def call_text(
         max_retries = 3,
         timeout     = 60.0,   # fail a hung/dropped stream fast instead of waiting forever
     )
-    completion = client.chat.completions.create(
-        model       = config.NVIDIA_MODEL,
-        messages    = [{"role": "user", "content": prompt}],
-        temperature = 0.2,
-        top_p       = 0.7,
-        max_tokens  = max_tokens,
-        stream      = True,
-    )
-    result = ""
-    for chunk in completion:
-        if chunk.choices and chunk.choices[0].delta.content is not None:
-            result += chunk.choices[0].delta.content
-    return result
+    
+    try:
+        completion = client.chat.completions.create(
+            model       = config.NVIDIA_MODEL,
+            messages    = [{"role": "user", "content": prompt}],
+            temperature = 0.2,
+            top_p       = 0.7,
+            max_tokens  = max_tokens,
+            stream      = True,
+        )
+        result = ""
+        for chunk in completion:
+            if chunk.choices and chunk.choices[0].delta.content is not None:
+                result += chunk.choices[0].delta.content
+        duration = time.time() - start_time
+        logger.info(f"Received text response ({len(result)} chars) in {duration:.2f}s")
+        return result
+    except Exception as exc:
+        duration = time.time() - start_time
+        logger.error(f"Text request failed after {duration:.2f}s: {exc}")
+        raise
 
 
 def call_vision(
@@ -91,6 +105,12 @@ def call_vision(
 
     Returns the full assembled response string.
     """
+    import time
+    import logging
+    logger = logging.getLogger(__name__)
+    start_time = time.time()
+    logger.info(f"Requesting vision model {config.NVIDIA_VISION_MODEL} ({len(images_b64)} images, prompt: {len(prompt)} chars)...")
+
     from openai import OpenAI
 
     client = OpenAI(
@@ -98,27 +118,34 @@ def call_vision(
         api_key     = api_key,
         max_retries = 3,
     )
-    content: list = []
-    for mime_type, b64_data in images_b64:
+    content = []
+    for mime, b64 in images_b64:
         content.append({
             "type": "image_url",
-            "image_url": {"url": f"data:{mime_type};base64,{b64_data}"},
+            "image_url": {"url": f"data:{mime};base64,{b64}"}
         })
     content.append({"type": "text", "text": prompt})
 
-    completion = client.chat.completions.create(
-        model       = config.NVIDIA_VISION_MODEL,
-        messages    = [{"role": "user", "content": content}],
-        temperature = 0.3,
-        top_p       = 0.7,
-        max_tokens  = max_tokens,
-        stream      = True,
-    )
-    result = ""
-    for chunk in completion:
-        if chunk.choices and chunk.choices[0].delta.content is not None:
-            result += chunk.choices[0].delta.content
-    return result
+    try:
+        completion = client.chat.completions.create(
+            model       = config.NVIDIA_VISION_MODEL,
+            messages    = [{"role": "user", "content": content}],
+            temperature = 0.2,
+            top_p       = 0.7,
+            max_tokens  = max_tokens,
+            stream      = True,
+        )
+        result = ""
+        for chunk in completion:
+            if chunk.choices and chunk.choices[0].delta.content is not None:
+                result += chunk.choices[0].delta.content
+        duration = time.time() - start_time
+        logger.info(f"Received vision response ({len(result)} chars) in {duration:.2f}s")
+        return result
+    except Exception as exc:
+        duration = time.time() - start_time
+        logger.error(f"Vision request failed after {duration:.2f}s: {exc}")
+        raise
 
 
 def validate_api_key(api_key: str) -> Tuple[bool, str]:

@@ -25,6 +25,7 @@ import { createContext, useContext, useReducer } from "react"
 export const PAGES = {
   // ── AI Voice app sections (current) ──────────────────────────────────────
   VOICEOVER:     "voiceover",     // the main, fully-built section
+  VIDEO_REFINE:  "video_refine",  // manga recaps — crop panels, refine, render
   TRANSCRIPTION: "transcription", // coming soon
   SUBTITLE:      "subtitle",      // coming soon
   REALTIME:      "realtime",      // coming soon

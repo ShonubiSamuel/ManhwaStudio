@@ -85,22 +85,34 @@ def call_text(
     Raises ImportError   if lmstudio SDK is not installed.
     """
     import lmstudio as lms
+    import time
+    import logging
+    logger = logging.getLogger(__name__)
+    start_time = time.time()
+    logger.info(f"Requesting LM Studio model {model or 'default'} (prompt: {len(prompt)} chars)...")
 
-    host = _find_host()
-    with lms.Client(host) as client:
-        lm_model = client.llm.model(
-            model or "default",
-            config={"contextLength": context_length},
-        )
-        result = lm_model.respond(
-            prompt,
-            config={
-                "maxTokens":   max_tokens,
-                "temperature": 0.2,
-                "topP":        0.7,
-            },
-        )
-    return str(result)
+    try:
+        host = _find_host()
+        with lms.Client(host) as client:
+            lm_model = client.llm.model(
+                model or "default",
+                config={"contextLength": context_length},
+            )
+            result = lm_model.respond(
+                prompt,
+                config={
+                    "maxTokens":   max_tokens,
+                    "temperature": 0.2,
+                    "topP":        0.7,
+                },
+            )
+            duration = time.time() - start_time
+            logger.info(f"Received text response ({len(result)} chars) in {duration:.2f}s")
+            return str(result)
+    except Exception as exc:
+        duration = time.time() - start_time
+        logger.error(f"LM Studio text request failed after {duration:.2f}s: {exc}")
+        raise
 
 
 def load_model(

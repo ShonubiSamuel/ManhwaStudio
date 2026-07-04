@@ -47,7 +47,11 @@ import time
 import threading
 import urllib.request
 import urllib.error
+import logging
 from pathlib import Path
+
+from logging_setup import setup_logging
+setup_logging()
 
 SCRIPTS_DIR  = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPTS_DIR.parent
@@ -245,4 +249,4 @@ if __name__ == "__main__":
     # Give the API object a reference to the window so file dialogs work
     pwa._window = window
 
-    webview.start()
+    webview.start(private_mode=False)

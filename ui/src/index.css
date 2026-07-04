@@ -55,6 +55,26 @@ a { color: inherit; text-decoration: none; }
   to { transform: rotate(360deg); }
 }
 
+@keyframes ms-spin-slow {
+  to { transform: rotate(360deg); }
+}
+
+/* Prevent blue highlighting on canvases and images */
+canvas, img {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+/* Hard kill for selection in specific interactive zones */
+.no-select, .no-select * {
+  -webkit-user-select: none !important;
+  user-select: none !important;
+}
+.no-select ::selection {
+  background: transparent !important;
+}
+
 /* ── Dub Studio: range sliders (volume / seek) ───────────────────────────── */
 
 input[type="range"].ms-range {

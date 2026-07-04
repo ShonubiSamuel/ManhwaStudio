@@ -537,6 +537,8 @@ class AdhocTranslateJob(BaseModel):
     log:     List[dict] = []
     error:   str = ""
 
+
+
 class AdhocSyncRequest(BaseModel):
     audio_url: str
     cues: List[dict]
@@ -551,6 +553,7 @@ class AdhocSyncJob(BaseModel):
     status: str = "running"         # running | done | failed
     message: str = ""
     synced_audio_url: str = ""
+    updated_cues: Optional[List[dict]] = None
     log: List[dict] = []
     error: str = ""
 

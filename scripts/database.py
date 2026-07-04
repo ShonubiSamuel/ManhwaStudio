@@ -208,6 +208,8 @@ class Database:
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._conn.execute("INSERT OR IGNORE INTO projects (id, name, folder_name, created_at, updated_at) VALUES (0, 'Dub Studio', 'dub_studio', 0, 0)")
+        self._conn.execute("INSERT OR IGNORE INTO episodes (id, project_id, title, source_type, source_path, output_folder, created_at, updated_at) VALUES (0, 0, 'Adhoc Jobs', 'video', '', '', 0, 0)")
         self._migrate()
 
     def close(self):
@@ -713,6 +715,50 @@ class Database:
             (episode_id, stage, status, now, now, error))
         return cur.lastrowid
 
+    def log_adhoc_start(self, stage: str, project_name: str = "Dub Studio") -> int:
+        """Start a live adhoc log entry so the UI can see it running immediately."""
+        now = self._now()
+        metadata = {"project_name": project_name, "log": []}
+        cur = self._execute(
+            "INSERT INTO processing_logs (episode_id, stage, status, started_at, metadata_json) "
+            "VALUES (0, ?, 'running', ?, ?)",
+            (stage, now, json.dumps(metadata)))
+        return cur.lastrowid
+
+    def log_adhoc_update(self, log_id: int, status: str, log_lines: list, error: str = ""):
+        """Update a running adhoc log entry with new lines or completion status."""
+        now = self._now()
+        row = self._fetchone("SELECT started_at, metadata_json FROM processing_logs WHERE id=?", (log_id,))
+        if not row: return
+        
+        try:
+            meta = json.loads(row["metadata_json"])
+        except Exception:
+            meta = {}
+            
+        meta["log"] = log_lines
+        dur = round(now - row["started_at"], 2)
+        
+        # Only set finished_at if it's done or failed
+        finished_at = now if status in ("done", "failed") else None
+        
+        self._execute(
+            "UPDATE processing_logs SET status=?, finished_at=?, "
+            "duration_secs=?, error=?, metadata_json=? WHERE id=?",
+            (status, finished_at, dur, error, json.dumps(meta), log_id))
+
+    def log_adhoc_activity(self, stage: str, status: str, duration_secs: float,
+                           log_lines: list, error: str = "", project_name: str = "") -> int:
+        """Record a completed adhoc action in one shot (legacy support)."""
+        now = self._now()
+        metadata = {"log": log_lines, "project_name": project_name}
+        cur = self._execute(
+            "INSERT INTO processing_logs (episode_id, stage, status, "
+            "started_at, finished_at, duration_secs, error, metadata_json) "
+            "VALUES (0, ?, ?, ?, ?, ?, ?, ?)",
+            (stage, status, now - duration_secs, now, duration_secs, error, json.dumps(metadata)))
+        return cur.lastrowid
+
     def get_episode_logs(self, episode_id: int) -> list[dict]:
         return self._rows(self._fetchall(
             "SELECT * FROM processing_logs WHERE episode_id=? ORDER BY started_at DESC",
@@ -721,14 +767,23 @@ class Database:
     def list_recent_logs(self, limit: int = 200) -> list[dict]:
         """Recent processing-log rows across all episodes, newest first,
         annotated with episode title + project name for the Logs archive."""
-        return self._rows(self._fetchall(
+        rows = self._rows(self._fetchall(
             """SELECT l.*, e.title AS episode_title, p.name AS project_name
                FROM processing_logs l
-               JOIN episodes e ON e.id = l.episode_id
-               JOIN projects p ON p.id = e.project_id
+               LEFT JOIN episodes e ON e.id = l.episode_id
+               LEFT JOIN projects p ON p.id = e.project_id
                ORDER BY l.started_at DESC
                LIMIT ?""",
             (int(limit),)))
+        
+        for r in rows:
+            if r["episode_id"] == 0 and r.get("metadata_json"):
+                try:
+                    meta = json.loads(r["metadata_json"])
+                    r["project_name"] = meta.get("project_name", "")
+                except Exception:
+                    pass
+        return rows
 
     def clear_logs(self, episode_id: int = None) -> int:
         """Delete processing-log rows (all, or one episode). Returns rows removed."""
