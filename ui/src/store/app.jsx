@@ -26,6 +26,7 @@ export const PAGES = {
   // ── AI Voice app sections (current) ──────────────────────────────────────
   VOICEOVER:     "voiceover",     // the main, fully-built section
   VIDEO_REFINE:  "video_refine",  // manga recaps — crop panels, refine, render
+  RECAP:         "recap",         // PDF → crops → AI narration → dub
   TRANSCRIPTION: "transcription", // coming soon
   SUBTITLE:      "subtitle",      // coming soon
   REALTIME:      "realtime",      // coming soon
@@ -46,8 +47,15 @@ const initialState = {
   /** Which top-level page is currently visible. */
   page: PAGES.VOICEOVER,
 
-  /** The project whose episodes are shown in the Library sidebar. */
+  /** The currently-open project. */
   activeProjectId: null,
+
+  /** Which SECTION opened it (Voiceover / Video Refine / Recap). All three
+   *  sections are mounted at once and read activeProjectId, so without this they
+   *  would each open the same project — cross-contaminating lists AND triple-
+   *  saving one session. Each section only treats a project as open when this
+   *  matches its own page. */
+  activeProjectSection: null,
 
   /**
    * The episode currently loaded into the Pipeline view.
@@ -79,12 +87,15 @@ function reducer(state, action) {
 
     case "SET_PROJECT":
       // Selecting a project clears the active episode — it belongs to a
-      // different context.
+      // different context. The section is whichever page opened it (you open a
+      // project from its own section's landing list), so the OTHER sections
+      // won't render an editor for it.
       return {
         ...state,
-        activeProjectId: action.projectId,
-        activeEpisode:   null,
-        stageRunning:    false,
+        activeProjectId:      action.projectId,
+        activeProjectSection: action.projectId == null ? null : (action.section || state.page),
+        activeEpisode:        null,
+        stageRunning:         false,
       }
 
     case "SET_EPISODE":
@@ -152,9 +163,9 @@ export const actions = {
   setPage: (page) =>
     ({ type: "SET_PAGE", page }),
 
-  /** Select a project in the Library (clears active episode). */
-  setProject: (projectId) =>
-    ({ type: "SET_PROJECT", projectId }),
+  /** Open a project in a section. `section` defaults to the current page. */
+  setProject: (projectId, section = null) =>
+    ({ type: "SET_PROJECT", projectId, section }),
 
   /** Load an episode into the Pipeline view (navigates to Pipeline). */
   setEpisode: (episode) =>

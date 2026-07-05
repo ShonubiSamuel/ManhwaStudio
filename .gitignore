@@ -181,3 +181,9 @@ cython_debug/
 .cursorindexingignore
 /input
 /output
+
+# SQLite transient files + Finder noise
+studio.db-shm
+studio.db-wal
+.DS_Store
+scripts/studio.db

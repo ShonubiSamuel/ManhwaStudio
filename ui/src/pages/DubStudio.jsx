@@ -17,9 +17,9 @@ import { useState, useEffect, useRef, useCallback, useMemo, forwardRef } from "r
 import { listVoices, getLanguages } from "../api/voices"
 import { startAdhocTranslate, getAdhocTranslateStatus, getAdhocSyncStatus, startDubCues, startRedubCue, refineCue, refineScript, getDubSession, saveDubSession, exportDub, startTranslateCues } from "../api/speech"
 import { listProjects } from "../api/projects"
-import { useApp, actions } from "../store/app"
+import { useApp, actions, PAGES } from "../store/app"
 import { useNotify } from "../store/notify"
-import { savePanel, deletePanel, upscaleAll, getUpscaleStatus } from "../api/videoRefine"
+import { savePanel, deletePanel, upscaleAll, getUpscaleStatus, narratePanels, getRecapState, saveRecapState, getNarratePlan } from "../api/videoRefine"
 import { FILES_ORIGIN, mediaSrc } from "../api/panels"
 import { colors, fonts, radius } from "../theme"
 import Button from "../components/Button"
@@ -59,6 +59,12 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
   const [dubUrls, setDubUrls] = useState({})         // { langName: syncedAudioUrl }
   const [speakersMap, setSpeakersMap] = useState({}) // { "Speaker 0": "alloy" }
   const [sourceLang, setSourceLang] = useState("English") // Original language of the source media
+  // Languages whose dub was fit to a timeline that has since MOVED (the source
+  // dub was regenerated and repacked). Non-destructive: just a banner until each
+  // language is re-translated/re-dubbed against the new timing.
+  const [staleTimingLangs, setStaleTimingLangs] = useState([])
+  const [kind, setKind] = useState("")   // "recap" = PDF-sourced (no video, cues from narration)
+  const [recapBoxes, setRecapBoxes] = useState([])   // persisted crop boxes (Recap)
 
   // Load this project's saved session (falling back to migrating the old global
   // localStorage session the first time, so nobody loses in-progress work).
@@ -76,14 +82,24 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
         if (s.pdfPath)     setPdfPath(s.pdfPath)
         if (Array.isArray(s.reviewed)) setReviewed(s.reviewed)
         // Multi-language: use the saved list, else migrate the single language.
-        const langs = Array.isArray(s.languages) && s.languages.length
+        let langs = Array.isArray(s.languages) && s.languages.length
           ? s.languages
           : (s.targetLang ? [{ name: s.targetLang, voice: s.voice || "" }] : [])
+        // Migration: older Video Refine sessions never seeded the ORIGINAL
+        // language into the list, so English was unselectable (no way to refine
+        // + dub the baseline). Insert it at the top.
+        const srcName = s.sourceLang || "English"
+        if (refine && !langs.some((l) => l.name === srcName)) {
+          langs = [{ name: srcName, voice: s.voice || "" }, ...langs]
+        }
         setLanguages(langs)
         setSelectedLang(s.selectedLang || langs[0]?.name || s.targetLang || "")
         setDubUrls(s.dubUrls || (s.ttsAudioUrl && s.targetLang ? { [s.targetLang]: s.ttsAudioUrl } : {}))
         if (s.speakersMap) setSpeakersMap(s.speakersMap)
         if (s.sourceLang) setSourceLang(s.sourceLang)
+        if (Array.isArray(s.staleTimingLangs)) setStaleTimingLangs(s.staleTimingLangs)
+        if (s.kind) setKind(s.kind)
+        if (Array.isArray(s.recapBoxes)) setRecapBoxes(s.recapBoxes)
       }
       if (s && Array.isArray(s.cues) && s.cues.length) {
         // Seed each cue's "dubbed" baseline when a dub already exists, so edits
@@ -96,6 +112,10 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
           // Ensure a per-language translations map exists (migrate the single field).
           if (!next.translations) next = { ...next, translations: seedLang ? { [seedLang]: c.translated || "" } : {} }
           if (!next.speaker) next = { ...next, speaker: "Speaker 0" }
+          // Frozen SOURCE timestamps: scrub the Source video with these forever.
+          // start/end is the (movable) dub timeline — it repacks when the source
+          // dub regenerates. Migration seeds them from the current start/end.
+          if (next.sourceStart === undefined) next = { ...next, sourceStart: next.start ?? 0, sourceEnd: next.end ?? 0 }
           return next
         }))
       } else {
@@ -124,12 +144,12 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
     const t = setTimeout(() => {
       saveDubSession(projectId, {
         cues: cues || [], ttsAudioUrl, targetLang, sourcePath, voice, reviewed, pdfPath,
-        languages, selectedLang, dubUrls, speakersMap, sourceLang,
+        languages, selectedLang, dubUrls, speakersMap, sourceLang, staleTimingLangs, kind, recapBoxes,
         updatedAt: Date.now(),
       }).catch(() => { /* best-effort; next change retries */ })
     }, 700)
     return () => clearTimeout(t)
-  }, [loaded, cues, ttsAudioUrl, targetLang, sourcePath, voice, reviewed, pdfPath, languages, selectedLang, dubUrls, speakersMap, sourceLang, projectId])
+  }, [loaded, cues, ttsAudioUrl, targetLang, sourcePath, voice, reviewed, pdfPath, languages, selectedLang, dubUrls, speakersMap, sourceLang, staleTimingLangs, kind, recapBoxes, projectId])
 
   // Voices + the shared dub-generation pipeline (TTS → sync). Used by BOTH the
   // setup screen's "Start Dubbing" and the editor's "Regenerate Dub", so a fresh
@@ -191,8 +211,19 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
       // If the backend repacked the timings (Video Refine original lang), use those updated cues.
       setCues((prev) => {
         const baseCues = cur.updated_cues || prev
-        return baseCues.map((c, i) => ({ ...c, dubbed: c.translated || prev[i]?.translated }))
+        return baseCues.map((c, i) => ({ ...c, dubbed: c.translated || prev[i]?.translated, dubbedVoice: speakersMap[c.speaker] || useVoice }))
       })
+      // Timeline honesty: repacking the SOURCE dub moves every cue's slot, so any
+      // other language's existing dub was fit to timing that no longer exists —
+      // flag them (non-destructive banner). Regenerating a translation's dub
+      // against the current timeline clears its flag.
+      if (refine) {
+        if (targetLang === sourceLang && cur.updated_cues) {
+          setStaleTimingLangs(languages.filter((l) => l.name !== sourceLang && dubUrls[l.name]).map((l) => l.name))
+        } else if (targetLang !== sourceLang) {
+          setStaleTimingLangs((prev) => prev.filter((n) => n !== targetLang))
+        }
+      }
       notify({ severity: "success", message: "Dub generated!" })
     } catch (err) {
       notify({ severity: "error", message: err.message })
@@ -200,7 +231,7 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
       setBusy(false)
       setStatusMsg("")
     }
-  }, [cues, voice, voices, targetLang, projectId, speakersMap, refine, sourceLang])
+  }, [cues, voice, voices, targetLang, projectId, speakersMap, refine, sourceLang, languages, dubUrls])
 
   // Extraction finished → load cues into the editor. Voiceover dubs immediately;
   // Video Refine just transcribes (you AI-Refine first, then translate + dub).
@@ -212,6 +243,10 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
         translated: "",
         translations: { [lang]: "" },
         speaker: "Speaker 0",
+        // Freeze the transcription timestamps — the Source tab scrubs with these
+        // forever, while start/end becomes the movable dub timeline.
+        sourceStart: c.start ?? 0,
+        sourceEnd: c.end ?? 0,
       })))
       // Auto-seed the source language into the languages list
       setLanguages((prev) => prev.some((l) => l.name === lang) ? prev : [{ name: lang, voice: voice || "" }, ...prev])
@@ -255,7 +290,7 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
       }
       localStorage.removeItem(lsKey)
       if (!cur || cur.status === "failed") throw new Error((cur && cur.error) || "Redub failed")
-      setCues((prev) => prev.map((x, i) => (i === idx ? { ...x, dubbed: x.translated } : x)))
+      setCues((prev) => prev.map((x, i) => (i === idx ? { ...x, dubbed: x.translated, dubbedVoice: speakersMap[x.speaker] || useVoice } : x)))
       const base = (cur.synced_audio_url || "").split("?")[0]
       if (base) setTtsAudioUrl(`${base}?v=${Date.now()}`)
       notify({ severity: "success", message: `Cue ${idx + 1} re-voiced` })
@@ -275,9 +310,9 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
     setSelectedLang(name); setTargetLang(name); setVoice(v)
     setTtsAudioUrl(dubUrls[name] || "")
     const hasDub = !!dubUrls[name]
-    setCues((prev) => prev.map((c) => {
+    setCues((prev) => prev.map((c, i, arr) => {
       const t = c.translations?.[name] || ""
-      const dur = Math.max(0, (c.end ?? 0) - (c.start ?? 0))
+      const dur = effDur(arr, i)
       const cps = computeCps(t, dur)
       return { ...c, translated: t, dubbed: hasDub ? t : undefined, cps, rushed: dur > 0 && cps > CPS_MAX }
     }))
@@ -320,11 +355,13 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
       localStorage.removeItem(lsKey)
       if (!cur || cur.status === "failed") throw new Error((cur && cur.error) || "Translation failed")
       const out = cur.cues || []
-      setCues((prev) => prev.map((c, i) => {
+      setCues((prev) => prev.map((c, i, arr) => {
         const t = out[i]?.translated || ""
-        const dur = Math.max(0, (c.end ?? 0) - (c.start ?? 0))
+        const dur = effDur(arr, i)
         const cps = computeCps(t, dur)
-        return { ...c, translated: t, translations: { ...(c.translations || {}), [selectedLang]: t }, cps, rushed: dur > 0 && cps > CPS_MAX }
+        // A fresh translation clears this language's "original changed" flag.
+        const staleLangs = (c.staleLangs || []).filter((n) => n !== selectedLang)
+        return { ...c, translated: t, translations: { ...(c.translations || {}), [selectedLang]: t }, staleLangs, cps, rushed: dur > 0 && cps > CPS_MAX }
       }))
       notify({ severity: "success", message: `Translated to ${selectedLang}` })
     } catch (e) {
@@ -360,7 +397,9 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
     )
   }
 
-  if (!cues || cues.length === 0) {
+  // Recap projects skip the setup screen entirely — there is no video to
+  // transcribe; cues are born from narrated PDF crops inside the editor.
+  if ((!cues || cues.length === 0) && kind !== "recap") {
     return (
       <SetupScreen
         onExtracted={onExtracted}
@@ -380,7 +419,7 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
     <AdvancedEditor
       projectId={projectId}
       onBack={onBack}
-      cues={cues} setCues={setCues}
+      cues={cues || []} setCues={setCues}
       sourcePath={sourcePath} setSourcePath={setSourcePath}
       ttsAudioUrl={ttsAudioUrl}
       targetLang={targetLang} setTargetLang={setTargetLang}
@@ -393,6 +432,8 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
       onAddLanguage={addLanguage} onTranslate={translateToSelected} translating={translating}
       speakersMap={speakersMap} setSpeakersMap={setSpeakersMap}
       sourceLang={sourceLang}
+      dubUrls={dubUrls} staleTimingLangs={staleTimingLangs}
+      recapMode={kind === "recap"} recapBoxes={recapBoxes} setRecapBoxes={setRecapBoxes}
     />
   )
 }
@@ -584,7 +625,7 @@ function useSplitter({ initial, min, max, axis }) {
    Advanced editor
 ───────────────────────────────────────────────────────────────────────────── */
 
-function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudioUrl, targetLang, voice, setVoice, voices, reviewed, setReviewed, generateDub, busy, statusMsg, redubOne, redubbing, refineMode = false, pdfPath = "", setPdfPath = () => {}, languages = [], selectedLang = "", onSwitchLang = () => {}, onAddLanguage = () => {}, onTranslate = () => {}, translating = false, speakersMap = {}, setSpeakersMap = () => {}, sourceLang = "English" }) {
+function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudioUrl, targetLang, voice, setVoice, voices, reviewed, setReviewed, generateDub, busy, statusMsg, redubOne, redubbing, refineMode = false, pdfPath = "", setPdfPath = () => {}, languages = [], selectedLang = "", onSwitchLang = () => {}, onAddLanguage = () => {}, onTranslate = () => {}, translating = false, speakersMap = {}, setSpeakersMap = () => {}, sourceLang = "English", dubUrls = {}, staleTimingLangs = [], recapMode = false, recapBoxes = [], setRecapBoxes = () => {} }) {
   const { notify } = useNotify()
   const [exporting, setExporting] = useState(false)
   const [speakerModalOpen, setSpeakerModalOpen] = useState(false)
@@ -595,7 +636,84 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
   const [cropIdx, setCropIdx] = useState(0)        // which cue a crop attaches to
   const [cropping, setCropping] = useState(false)
   const [upscaling, setUpscaling] = useState(null) // {total,done} | null
-  const [selected, setSelected] = useState(() => new Set())   // cues picked for Combine
+
+  // ── Recap: PDF crops → AI narration → cues ────────────────────────────────
+  const [pendingCrops, setPendingCrops] = useState(null)   // crops awaiting the prompt confirm
+  const [narrating, setNarrating] = useState(false)
+  const [narrPrompt, setNarrPrompt] = useState(
+    "Write an engaging, dramatic third-person recap narration in present tense — punchy, flowing, like a top manhwa recap channel.")
+  const [castSeed, setCastSeed] = useState("")            // authoritative cast list (names + looks)
+  const [registry, setRegistry] = useState({ characters: [] })
+  const [resetMemory, setResetMemory] = useState(false)  // start a fresh chapter
+  const [registryOpen, setRegistryOpen] = useState(false)
+
+  // Load the project's character registry + cast seed once (Recap mode).
+  useEffect(() => {
+    if (!recapMode) return
+    getRecapState(projectId).then((s) => {
+      setRegistry(s?.registry || { characters: [] })
+      setCastSeed(s?.cast_seed || "")
+    }).catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, recapMode])
+
+  const runNarration = async () => {
+    const crops = (pendingCrops || []).filter((c) => c && c.data && c.data.length > 200)
+    setPendingCrops(null)
+    if (!crops.length) { notify({ severity: "error", message: "No usable crops to narrate." }); return }
+    setNarrating(true)
+    try {
+      // Persist the cast seed first so the pipeline's identity resolver uses it.
+      await saveRecapState(projectId, { cast_seed: castSeed }).catch(() => {})
+      // Batch size adapts to the ACTUAL model: the backend caps our preference to
+      // what the vision model accepts (a 1-image model → 1). The registry + story
+      // memory carry forward server-side, so narration stays name-aware.
+      const plan = await getNarratePlan().catch(() => ({ effective_batch: 2 }))
+      const BATCH = Math.max(1, plan.effective_batch || 2)
+      if (plan.vision_model) {
+        notify({ severity: "info", message: `Vision: ${plan.vision_model} · Story: ${plan.reasoner_model} · ${BATCH} panel(s)/call` })
+      }
+      const startIdx = (cues || []).length            // append: chapter by chapter
+      const lines = new Array(crops.length).fill("")
+      let latestRegistry = registry
+      for (let s = 0; s < crops.length; s += BATCH) {
+        notify({ severity: "info", message: `Narrating panels ${s + 1}–${Math.min(s + BATCH, crops.length)} of ${crops.length}…` })
+        const batch = crops.slice(s, s + BATCH).map((c, k) => ({ index: s + k, data: c.data }))
+        const res = await narratePanels(projectId, narrPrompt, batch, s === 0 && resetMemory)
+        for (const l of res.lines || []) lines[l.index] = l.text || ""
+        if (res.registry) latestRegistry = res.registry
+      }
+      setRegistry(latestRegistry)
+      setResetMemory(false)
+      // Save each crop as its cue's panel, then append the new cues. Timing is a
+      // provisional estimate — the ENGLISH dub repack defines the real timeline.
+      const newCues = []
+      let t = (cues || []).reduce((m, c) => Math.max(m, c.end ?? 0), 0)
+      if (t > 0) t += 0.5
+      for (let i = 0; i < crops.length; i++) {
+        const saved = await savePanel(projectId, startIdx + i, crops[i].data)
+        const text = lines[i] || ""
+        const dur = Math.max(2.5, Math.min(14, text.length / 15))
+        newCues.push({
+          // The narration seeds BOTH the original and the source-language slot,
+          // so the English dub can generate immediately (AI Refine optional).
+          text, translated: text, translations: { [sourceLang]: text }, speaker: "Speaker 0",
+          start: +t.toFixed(2), end: +(t + dur).toFixed(2),
+          sourceStart: +t.toFixed(2), sourceEnd: +(t + dur).toFixed(2),
+          // eslint-disable-next-line react-hooks/purity -- event handler, not render (cache-bust query)
+          image: (saved.image || "") + `?v=${Date.now()}`, raw: saved.raw || "",
+        })
+        t += dur + 0.3
+      }
+      setUndoStack((st) => [...st, cues]); setRedoStack([])
+      setCues((prev) => [...(prev || []), ...newCues])
+      notify({ severity: "success", message: `${crops.length} panel(s) narrated → ${crops.length} new cue(s)` })
+    } catch (e) {
+      notify({ severity: "error", message: e.message })
+    } finally {
+      setNarrating(false)
+    }
+  }
   const [addLangOpen, setAddLangOpen] = useState(false)       // add-language modal
 
   const openPdf = async () => {
@@ -676,6 +794,7 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
   const cueListRef = useRef(null)
   const timelineScrollRef = useRef(null)
   const stopAtRef = useRef(null)
+  const playIntentRef = useRef(false)  // guards zombie canplay listeners
 
   const totalTime = useMemo(() => maxTime(cues), [cues])
 
@@ -685,24 +804,69 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
 
   /* ── Media element wiring ─────────────────────────────────────────────── */
 
-  // Keep volumes / rate in sync.  The source video is MUTED via the element's
-  // own `muted` flag when its slider is 0, so the dub track is audible alone.
+  // TWO CLOCKS, ONE DRIVER. In Video Refine each tab owns exactly one engine:
+  //   Source  → the <video> plays with its own audio (dub fully stopped),
+  //   Preview → the dub <audio> plays on ITS OWN clock (video fully stopped),
+  //   Panels  → nothing plays.
+  // Voiceover (refineMode=false) keeps the classic coupled behavior: the video
+  // is the clock and the dub audio rides along, mixed by the two sliders.
+  const driver = refineMode
+    ? (rightView === "preview" ? "audio" : rightView === "source" ? "video" : "none")
+    : "video"
+  const [audioDuration, setAudioDuration] = useState(0)
+
+  // Switching tabs stops whatever was playing — the engines never overlap.
+  // setPlaying here syncs React to the elements we just paused: their own
+  // onPause handlers are driver-gated and the driver has ALREADY changed by the
+  // time the pause event fires, so they can't be relied on for this transition.
+  useEffect(() => {
+    if (!refineMode) return
+    videoRef.current?.pause()
+    audioRef.current?.pause()
+    playIntentRef.current = false
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPlaying(false)
+  }, [rightView, refineMode])
+
+  // Pause all media when the user navigates to a different page.
+  // Pages are kept mounted (display:none) to preserve state, but CSS hiding
+  // does NOT stop <video>/<audio> playback — we must do it explicitly.
+  const { state: appState } = useApp()
+  const ownerPage = refineMode ? PAGES.VIDEO_REFINE : (recapMode ? PAGES.RECAP : PAGES.VOICEOVER)
+  useEffect(() => {
+    if (appState.page !== ownerPage) {
+      videoRef.current?.pause()
+      audioRef.current?.pause()
+      playIntentRef.current = false
+      setPlaying(false)
+    }
+    return () => {
+      // Unmount cleanup: stop any playing media when the component is removed
+      // (e.g. navigating back to the project list within the same page).
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      videoRef.current?.pause()
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      audioRef.current?.pause()
+    }
+  }, [appState.page, ownerPage])
+
+  // Ref mirror of "is this editor's page the active one?" — the spacebar
+  // handler captures this via ref so it never fires on a hidden page (all pages
+  // stay mounted, so ALL their global keydown listeners fire simultaneously).
+  const isActivePageRef = useRef(true)
+  useEffect(() => { isActivePageRef.current = appState.page === ownerPage }, [appState.page, ownerPage])
+
+  // Keep volumes / rate in sync. The sliders are the ONLY mixing authority
+  // within the active engine; WHICH engine runs is decided by the tab (driver),
+  // never by muting the other one in the background.
   useEffect(() => {
     const v = videoRef.current
-    if (v) { 
-      const isSource = rightView === "source"
-      v.volume = isSource ? sourceVol / 10 : 0
-      v.muted = !isSource || sourceVol === 0
-    }
-  }, [sourceVol, rightView])
+    if (v) { v.volume = sourceVol / 10; v.muted = sourceVol === 0 }
+  }, [sourceVol])
   useEffect(() => {
     const a = audioRef.current
-    if (a) {
-      const isDub = rightView !== "source"
-      a.volume = isDub ? dubVol / 10 : 0
-      a.muted = !isDub || dubVol === 0
-    }
-  }, [dubVol, ttsAudioUrl, rightView])
+    if (a) { a.volume = dubVol / 10; a.muted = dubVol === 0 }
+  }, [dubVol, ttsAudioUrl])
   useEffect(() => { if (videoRef.current) videoRef.current.playbackRate = speed }, [speed])
   useEffect(() => { if (audioRef.current) audioRef.current.playbackRate = speed }, [speed, ttsAudioUrl])
 
@@ -714,16 +878,17 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
   }, [ttsAudioUrl])
 
   const syncDub = useCallback(() => {
+    if (driver !== "video" || refineMode) return   // coupled mode only (Voiceover)
     const v = videoRef.current, a = audioRef.current
     if (!v || !a) return
     if (Math.abs(a.currentTime - v.currentTime) > 0.25) {
       try { a.currentTime = v.currentTime } catch { /* not yet seekable */ }
     }
-  }, [])
+  }, [driver, refineMode])
 
   const onTimeUpdate = useCallback(() => {
     const v = videoRef.current
-    if (!v) return
+    if (!v || driver !== "video") return
     setCurrentTime(v.currentTime)
     // NOTE: never re-seek the dub audio while it's playing — a seek mid-playback
     // glitches the sound. The two elements are started together and both advance
@@ -732,45 +897,80 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
       stopAtRef.current = null
       v.pause()
     }
-  }, [])
+  }, [driver])
+
+  // The dub audio's OWN clock — drives the playhead/panel image on Preview.
+  const onAudioTime = useCallback(() => {
+    const a = audioRef.current
+    if (!a || driver !== "audio") return
+    setCurrentTime(a.currentTime)
+    if (stopAtRef.current != null && a.currentTime >= stopAtRef.current) {
+      stopAtRef.current = null
+      a.pause()
+    }
+  }, [driver])
 
   const play = useCallback(() => {
     const v = videoRef.current, a = audioRef.current
+    if (driver === "none") return
+    playIntentRef.current = true
+    if (driver === "audio") {
+      if (!a) return
+      a.play().catch(() => {
+        a.addEventListener("canplay",
+          () => { if (playIntentRef.current) a.play().catch((err) => console.warn("dub audio play blocked:", err)) },
+          { once: true })
+      })
+      return
+    }
     if (!v) return
     v.play()
-    if (a) {
+    // Voiceover only: the dub rides along with the video. In refine Source tab
+    // the dub stays stopped — you're listening to the original.
+    if (!refineMode && a) {
       try { a.currentTime = v.currentTime } catch { /* */ }
       a.play().catch(() => {
         a.addEventListener("canplay",
-          () => a.play().catch((err) => console.warn("dub audio play blocked:", err)),
+          () => { if (playIntentRef.current) a.play().catch((err) => console.warn("dub audio play blocked:", err)) },
           { once: true })
       })
     }
-  }, [])
+  }, [driver, refineMode])
 
   const pause = useCallback(() => {
+    playIntentRef.current = false
     videoRef.current?.pause()
     audioRef.current?.pause()
   }, [])
 
   const togglePlay = useCallback(() => {
     stopAtRef.current = null
-    if (videoRef.current?.paused) play(); else pause()
-  }, [play, pause])
+    const el = driver === "audio" ? audioRef.current : videoRef.current
+    if (!el || driver === "none") return
+    if (el.paused) play(); else pause()
+  }, [play, pause, driver])
 
   const seek = useCallback((t) => {
     const v = videoRef.current, a = audioRef.current
-    const clamped = Math.max(0, Math.min(t, duration || totalTime))
-    if (v) v.currentTime = clamped
-    if (a) { try { a.currentTime = clamped } catch { /* */ } }
+    const limit = driver === "audio" ? (audioDuration || totalTime) : (duration || totalTime)
+    const clamped = Math.max(0, Math.min(t, limit))
+    if (driver === "audio") {
+      if (a) { try { a.currentTime = clamped } catch { /* */ } }
+    } else {
+      if (v) v.currentTime = clamped
+      if (!refineMode && a) { try { a.currentTime = clamped } catch { /* */ } }
+    }
     setCurrentTime(clamped)
-  }, [duration, totalTime])
+  }, [duration, totalTime, audioDuration, driver, refineMode])
 
   const playCue = useCallback((c) => {
-    stopAtRef.current = c.end
-    seek(c.start)
+    // Source tab scrubs the FROZEN transcription timestamps; everything else
+    // (Preview / Voiceover) runs on the dub timeline (start/end).
+    const useSource = refineMode && driver === "video"
+    stopAtRef.current = useSource ? (c.sourceEnd ?? c.end) : c.end
+    seek(useSource ? (c.sourceStart ?? c.start) : c.start)
     setTimeout(play, 0)
-  }, [seek, play])
+  }, [seek, play, driver, refineMode])
 
   // Spacebar toggles playback — except while typing in a text field (so editing
   // a translation with spaces still works normally).
@@ -779,6 +979,9 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
       if (e.code !== "Space" && e.key !== " ") return
       const t = e.target
       if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.isContentEditable)) return
+      // Only the ACTIVE page's editor should respond — all pages stay mounted
+      // (display:none) so every editor's global listener fires on every keypress.
+      if (!isActivePageRef.current) return
       e.preventDefault()
       togglePlay()
     }
@@ -790,10 +993,17 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
   // smoothly between ticks via a CSS transition — no per-frame React re-render
   // (which was saturating the main thread and breaking audio).
 
-  const activeIdx = useMemo(
-    () => cues.findIndex((c) => currentTime >= c.start && currentTime < c.end),
-    [cues, currentTime],
-  )
+  // Which cue is under the playhead. On the Source tab the clock is the video,
+  // so match against the FROZEN transcription timestamps; everywhere else the
+  // clock runs on the dub timeline (start/end).
+  const activeIdx = useMemo(() => {
+    const srcClock = refineMode && rightView === "source"
+    return cues.findIndex((c) => {
+      const s = srcClock ? (c.sourceStart ?? c.start) : c.start
+      const e = srcClock ? (c.sourceEnd ?? c.end) : c.end
+      return currentTime >= s && currentTime < e
+    })
+  }, [cues, currentTime, refineMode, rightView])
 
   // Auto-scroll the timeline + cue list to keep the playhead/active cue visible.
   useEffect(() => {
@@ -821,44 +1031,90 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
     setCues((prev) => {
       const next = [...prev]
       const c = next[idx]
-      const dur = Math.max(0, (c.end ?? 0) - (c.start ?? 0))
+      const dur = effDur(next, idx)
       const cps = computeCps(newTranslated, dur)
       // Keep the per-language map in sync with the active language (Video Refine).
       const translations = refineMode ? { ...(c.translations || {}), [selectedLang]: newTranslated } : c.translations
-      next[idx] = { ...c, translated: newTranslated, translations, cps, rushed: dur > 0 && cps > CPS_MAX }
+      // Invariant: when the ORIGINAL language is selected, text and translated
+      // are the same thing (the refined original) — keep them in lockstep so
+      // Translate always works from the refined text, and flag other languages'
+      // existing translations as stale.
+      const isSource = refineMode && selectedLang === sourceLang
+      const staleLangs = isSource
+        ? [...new Set([...(c.staleLangs || []),
+            ...Object.keys(c.translations || {}).filter((k) => k !== sourceLang && (c.translations[k] || "").trim())])]
+        : c.staleLangs
+      next[idx] = { ...c, translated: newTranslated, translations, cps, rushed: dur > 0 && cps > CPS_MAX,
+        ...(isSource ? { text: newTranslated, staleLangs } : {}) }
       return next
     })
   }
 
-  // ── Combine selected cues into one (Video Refine) ─────────────────────────
-  const toggleSelect = (idx) => setSelected((s) => { const n = new Set(s); n.has(idx) ? n.delete(idx) : n.add(idx); return n })
-  const combineSelected = () => {
-    const idxs = [...selected].sort((a, b) => a - b)
-    if (idxs.length < 2) return
+  // Edit the ORIGINAL text directly (the top box — refine mode only). Syncs the
+  // source-language slot and flags every already-translated language as stale
+  // for this cue (non-destructive: a badge, nothing is deleted).
+  const updateOriginal = (idx, t) => {
+    setCues((prev) => prev.map((c, i, arr) => {
+      if (i !== idx) return c
+      const others = Object.keys(c.translations || {}).filter((k) => k !== sourceLang && (c.translations[k] || "").trim())
+      const staleLangs = [...new Set([...(c.staleLangs || []), ...others])]
+      const translations = { ...(c.translations || {}), [sourceLang]: t }
+      const base = { ...c, text: t, translations, staleLangs }
+      if (selectedLang === sourceLang) {
+        const dur = effDur(arr, i)
+        const cps = computeCps(t, dur)
+        return { ...base, translated: t, cps, rushed: dur > 0 && cps > CPS_MAX }
+      }
+      return base
+    }))
+  }
+
+  // ── Maestra-style per-cue actions (hover ✕ delete, +/merge between cues) ──
+  const join = (arr) => arr.filter(Boolean).join(" ").replace(/\s+/g, " ").trim()
+
+  const deleteCue = (idx) => {
+    pushUndo()
+    setCues((prev) => prev.filter((_, i) => i !== idx))
+  }
+
+  // Merge cue idx with the one AFTER it (the between-cue merge control).
+  const mergeAdjacent = (idx) => {
+    if (idx < 0 || idx + 1 >= cues.length) return
     pushUndo()
     setCues((prev) => {
-      const group = idxs.map((i) => prev[i])
-      const join = (arr) => arr.filter(Boolean).join(" ").replace(/\s+/g, " ").trim()
+      const a = prev[idx], b = prev[idx + 1]
       const translations = {}
-      group.forEach((c) => { for (const k in (c.translations || {})) translations[k] = join([translations[k], c.translations[k]]) })
-      const start = Math.min(...group.map((c) => c.start ?? 0))
-      const end = Math.max(...group.map((c) => c.end ?? 0))
-      const translated = translations[targetLang] || join(group.map((c) => c.translated))
-      const cps = computeCps(translated, Math.max(0, end - start))
+      for (const c of [a, b]) for (const k in (c.translations || {})) translations[k] = join([translations[k], c.translations[k]])
+      const start = Math.min(a.start ?? 0, b.start ?? 0)
+      const end = Math.max(a.end ?? 0, b.end ?? 0)
+      const translated = translations[targetLang] || join([a.translated, b.translated])
+      const cps = computeCps(translated, Math.max(0, effDur(prev, idx)))
       const merged = {
-        ...group[0],
-        text: join(group.map((c) => c.text)),
+        ...a,
+        text: join([a.text, b.text]),
         translated, translations, start, end, cps, rushed: cps > CPS_MAX,
-        image: group.find((c) => c.image)?.image || null,
-        raw: group.find((c) => c.raw)?.raw || null,
-        dubbed: undefined,
+        image: a.image || b.image || null, raw: a.raw || b.raw || null, dubbed: undefined,
       }
-      const out = []
-      prev.forEach((c, i) => { if (i === idxs[0]) out.push(merged); else if (!idxs.includes(i)) out.push(c) })
-      return out
+      return prev.flatMap((c, i) => (i === idx ? [merged] : i === idx + 1 ? [] : [c]))
     })
-    setSelected(new Set())
-    notify({ severity: "success", message: `Combined ${idxs.length} cues` })
+  }
+
+  // Insert a fresh empty cue AFTER idx, timed into the gap to the next cue.
+  const insertCueAfter = (idx) => {
+    pushUndo()
+    setCues((prev) => {
+      const a = prev[idx]
+      const next = prev[idx + 1]
+      const s = a ? (a.end ?? 0) : 0
+      const e = next ? Math.max(s + 0.5, (next.start ?? s + 2)) : s + 2.5
+      const fresh = {
+        text: "", translated: "", translations: refineMode ? { [sourceLang]: "" } : {},
+        speaker: a?.speaker || "Speaker 0",
+        start: +s.toFixed(2), end: +e.toFixed(2), sourceStart: +s.toFixed(2), sourceEnd: +e.toFixed(2),
+        cps: 0, image: null, raw: null,
+      }
+      return [...prev.slice(0, idx + 1), fresh, ...prev.slice(idx + 1)]
+    })
   }
 
   const refine = async (idx) => {
@@ -869,20 +1125,24 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
     try {
       const res = await refineCue({
         text: c.text, translated: c.translated,
-        start: c.start, end: c.end, langCode: targetLang,
+        // Judge against the EFFECTIVE window (until the next cue speaks) — the
+        // raw end-start made short-slot lines look impossible to fix (26+ CPS)
+        // when their audio actually fit in the dead air that followed.
+        start: c.start, end: (c.start ?? 0) + effDur(cues, idx), langCode: targetLang,
       })
       if (res?.changed === false) {
         notify({ severity: "info", message: `Cue ${idx + 1} already fits (${res.cps} CPS) — no change.` })
       } else if (res?.translated) {
         setUndoStack((s) => [...s, before])   // make the AI edit undoable
         setRedoStack([])
-        const next = cues.map((x, i) => (i === idx ? { 
+        const next = cues.map((x, i) => (i === idx ? {
           ...x,
           text: selectedLang === sourceLang ? res.translated : x.text,
-          translated: res.translated, 
+          translated: res.translated,
           translations: { ...(x.translations || {}), [selectedLang]: res.translated },
-          cps: res.cps, 
-          rushed: res.rushed 
+          staleLangs: (x.staleLangs || []).filter((n) => n !== selectedLang),
+          cps: res.cps,
+          rushed: res.rushed
         } : x))
         setCues(next)
         notify({ severity: "success", message: `Cue ${idx + 1} refined → ${res.cps} CPS` })
@@ -942,22 +1202,29 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
     try {
       const res = await refineScript(
         cues.map((c) => c.translated || c.text || ""),
-        { durations: cues.map((c) => Math.max(0, (c.end ?? 0) - (c.start ?? 0))), level: "standard", instructions, lang: targetLang },
+        { durations: cues.map((c, i) => effDur(cues, i)), level: "standard", instructions, lang: targetLang },
       )
       const lines = res?.lines || []
       setUndoStack((s) => [...s, cues])    // whole-script refine is one undo step
       setRedoStack([])
-      setCues((prev) => prev.map((c, i) => {
+      setCues((prev) => prev.map((c, i, arr) => {
         const t = lines[i] ?? c.translated ?? c.text
-        const dur = Math.max(0, (c.end ?? 0) - (c.start ?? 0))
+        const dur = effDur(arr, i)
         const cps = computeCps(t, dur)
-        return { 
-          ...c, 
+        // Refining the ORIGINAL flags every already-translated language stale;
+        // refining a translation clears that language's own flag.
+        const staleLangs = selectedLang === sourceLang
+          ? [...new Set([...(c.staleLangs || []),
+              ...Object.keys(c.translations || {}).filter((k) => k !== sourceLang && (c.translations[k] || "").trim())])]
+          : (c.staleLangs || []).filter((n) => n !== selectedLang)
+        return {
+          ...c,
           text: selectedLang === sourceLang ? t : c.text,
-          translated: t, 
+          translated: t,
           translations: { ...(c.translations || {}), [selectedLang]: t },
-          cps, 
-          rushed: dur > 0 && cps > CPS_MAX 
+          staleLangs,
+          cps,
+          rushed: dur > 0 && cps > CPS_MAX
         }
       }))
       notify({ severity: "success", message: `Refined — Undo to revert` })
@@ -1003,7 +1270,7 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
     }
   }
 
-  const videoSrc = mediaSrc(sourcePath)
+  const videoSrc = recapMode ? "" : mediaSrc(sourcePath)   // recap: the "source" is the PDF
 
   /* ── Render ───────────────────────────────────────────────────────────── */
 
@@ -1022,12 +1289,54 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
           onClose={() => setAddLangOpen(false)}
           onAdd={(name, vname) => { onAddLanguage(name, vname); setAddLangOpen(false) }} />
       )}
+      {pendingCrops && (
+        <div onClick={() => setPendingCrops(null)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200 }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: 600, maxHeight: "88vh", overflowY: "auto", background: colors.panel, border: `1px solid ${colors.border}`, borderRadius: radius.lg, padding: 24 }}>
+            <h2 style={{ color: colors.text, fontSize: fonts.xl, fontWeight: fonts.bold, marginBottom: 6 }}>Narrate {pendingCrops.length} panel{pendingCrops.length === 1 ? "" : "s"}</h2>
+            <p style={{ color: colors.muted, fontSize: fonts.sm, marginBottom: 14 }}>
+              A two-step storyteller: vision reads each panel, then a reasoning model resolves who's who (using the cast + memory below) and narrates. The character registry & story carry forward across batches — so names, relationships and appearance changes stay consistent.
+            </p>
+
+            <label style={{ display: "block", color: colors.textDim, fontSize: fonts.sm, marginBottom: 6 }}>Cast list <span style={{ color: colors.muted }}>(optional but recommended — anchors identities)</span></label>
+            <textarea value={castSeed} onChange={(e) => setCastSeed(e.target.value)} rows={3}
+              placeholder={"Sung Jin-Woo — black hair, hunter; later muscular Shadow Monarch\nCha Hae-In — blonde, S-rank, ally of Jin-Woo"}
+              style={{ width: "100%", background: colors.panel2, border: `1px solid ${colors.border}`, color: colors.text, padding: "9px 12px", borderRadius: radius.md, marginBottom: 14, fontFamily: fonts.ui, resize: "vertical" }} />
+
+            <label style={{ display: "block", color: colors.textDim, fontSize: fonts.sm, marginBottom: 6 }}>Narration style / instructions</label>
+            <textarea value={narrPrompt} onChange={(e) => setNarrPrompt(e.target.value)} rows={3}
+              style={{ width: "100%", background: colors.panel2, border: `1px solid ${colors.border}`, color: colors.text, padding: "9px 12px", borderRadius: radius.md, marginBottom: 12, fontFamily: fonts.ui, resize: "vertical" }} />
+
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, color: colors.textDim, fontSize: fonts.sm, cursor: "pointer" }}>
+                <input type="checkbox" checked={resetMemory} onChange={(e) => setResetMemory(e.target.checked)} style={{ accentColor: colors.accent }} />
+                Start a new chapter (reset story memory — keeps the character registry)
+              </label>
+              <button onClick={() => { setPendingCrops(null); setRegistryOpen(true) }}
+                style={{ color: colors.accent, fontSize: fonts.sm, background: "none", border: "none", cursor: "pointer" }}>
+                👥 {registry.characters?.length || 0} character(s) — edit registry
+              </button>
+            </div>
+
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <Button variant="secondary" onClick={() => setPendingCrops(null)}>Cancel</Button>
+              <Button variant="primary" onClick={runNarration}>🪄 Narrate</Button>
+            </div>
+          </div>
+        </div>
+      )}
+      {registryOpen && (
+        <CharacterRegistryModal
+          registry={registry} setRegistry={setRegistry}
+          onClose={() => setRegistryOpen(false)}
+          onSave={(reg) => { setRegistry(reg); saveRecapState(projectId, { registry: reg }).catch(() => {}); setRegistryOpen(false) }} />
+      )}
       {speakerModalOpen && (
-        <SpeakerModal 
-          speakersMap={speakersMap} 
-          setSpeakersMap={setSpeakersMap} 
-          voices={voices} 
-          onClose={() => setSpeakerModalOpen(false)} 
+        <SpeakerModal
+          speakersMap={speakersMap}
+          setSpeakersMap={setSpeakersMap}
+          voices={voices}
+          defaultVoice={voice}
+          onClose={() => setSpeakerModalOpen(false)}
           onAddSpeaker={(newSpeaker) => setSpeakersMap(prev => ({ ...prev, [newSpeaker]: "" }))}
         />
       )}
@@ -1078,34 +1387,71 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              {refineMode && selected.size >= 2 && (
-                <Button variant="secondary" onClick={combineSelected}>⛓ Combine {selected.size}</Button>
-              )}
               {refineMode && selectedLang !== sourceLang && (
                 <Button variant="secondary" onClick={onTranslate} disabled={translating || !selectedLang} loading={translating}
                   title={`Translate the ${sourceLang} cues to ${selectedLang || "the selected language"}`}>
                   {translating ? "Translating…" : `🌐 Translate`}
                 </Button>
               )}
-              <Button variant="primary" onClick={() => generateDub()} disabled={busy || (refineMode && !selectedLang) || (refineMode && selectedLang === sourceLang && !cues.some(c => c.translated))} loading={busy}
-                title={refineMode && selectedLang === sourceLang && !cues.some(c => c.translated) ? "You must refine the original text before generating a dub" : "Generate the voiceover: text-to-speech + sync to the timeline"}
+              {recapMode && (
+                <Button variant="secondary" onClick={() => setRegistryOpen(true)}
+                  title="View / edit the character registry the narrator uses">
+                  👥 {registry.characters?.length || 0}
+                </Button>
+              )}
+              <Button variant="primary" onClick={() => generateDub()}
+                disabled={busy || (refineMode && !selectedLang)
+                  || (refineMode && selectedLang === sourceLang && !cues.some(c => c.translated))
+                  || (refineMode && selectedLang !== sourceLang && !dubUrls[sourceLang])}
+                loading={busy}
+                title={refineMode && selectedLang === sourceLang && !cues.some(c => c.translated)
+                  ? "You must refine the original text before generating a dub"
+                  : refineMode && selectedLang !== sourceLang && !dubUrls[sourceLang]
+                    ? `Generate the ${sourceLang} (original) dub first — it defines the timeline every translation fits into`
+                    : "Generate the voiceover: text-to-speech + sync to the timeline"}
                 style={{ background: colors.accent, color: "#000", fontWeight: fonts.bold, border: "none", borderRadius: radius.full, padding: "8px 18px" }}>
-                {busy ? statusMsg || "Working…" : (ttsAudioUrl ? "✨ Regenerate Dub" : "✨ Generate Dub")}
+                {busy ? statusMsg || "Working…"
+                  : `✨ ${ttsAudioUrl ? "Regenerate" : "Generate"}${refineMode && selectedLang ? ` ${selectedLang}` : ""} Dub`}
               </Button>
             </div>
           </div>
 
+          {/* Workflow banners (Video Refine) — non-destructive honesty signals */}
+          {refineMode && selectedLang !== sourceLang && !dubUrls[sourceLang] && (
+            <div style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, padding: "8px 16px", background: "rgba(251,191,36,0.10)", borderBottom: `1px solid rgba(251,191,36,0.35)`, color: colors.warning, fontSize: fonts.sm }}>
+              <span>⚠</span>
+              <span>Generate the <b>{sourceLang} (Original)</b> dub first — it defines the timeline that {selectedLang || "each translation"} will be fitted into.</span>
+            </div>
+          )}
+          {refineMode && staleTimingLangs.length > 0 && (
+            <div style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, padding: "8px 16px", background: "rgba(251,191,36,0.10)", borderBottom: `1px solid rgba(251,191,36,0.35)`, color: colors.warning, fontSize: fonts.sm }}>
+              <span>⚠</span>
+              <span>The {sourceLang} timing changed — <b>{staleTimingLangs.join(", ")}</b> {staleTimingLangs.length > 1 ? "were" : "was"} fit to the old timeline. Re-translate + regenerate {staleTimingLangs.length > 1 ? "their dubs" : "its dub"} when ready.</span>
+            </div>
+          )}
+
           {/* Cue list */}
-          <div ref={cueListRef} style={{ flex: 1, overflowY: "auto", padding: "20px 16px", display: "flex", flexDirection: "column", gap: 18 }}>
+          <div ref={cueListRef} style={{ flex: 1, overflowY: "auto", padding: "20px 16px", display: "flex", flexDirection: "column", gap: 4 }}>
+            {recapMode && cues.length === 0 && (
+              <div style={{ margin: "auto", maxWidth: 340, textAlign: "center", color: colors.muted, display: "flex", flexDirection: "column", gap: 8 }}>
+                <div style={{ fontSize: 30 }}>🪄</div>
+                <div style={{ color: colors.text, fontWeight: fonts.bold }}>No cues yet</div>
+                <div style={{ fontSize: fonts.sm, lineHeight: 1.5 }}>
+                  On the right, drag boxes over the panels you want (they stack up and stay), then hit
+                  <b style={{ color: colors.accent }}> Narrate crops</b>. Each crop becomes a cue here with its own AI narration.
+                </div>
+              </div>
+            )}
+            {cues.length > 0 && <CueDivider onInsert={() => insertCueAfter(-1)} />}
             {cues.map((c, i) => (
+              <div key={i}>
               <CueRow
-                key={i}
                 index={i}
                 cue={c}
                 active={i === activeIdx}
                 reviewed={reviewed.includes(i)}
                 refining={refining.has(i)}
-                dirty={!!ttsAudioUrl && c.dubbed !== undefined && c.translated !== c.dubbed}
+                dirty={!!ttsAudioUrl && c.dubbed !== undefined && (c.translated !== c.dubbed || (c.dubbedVoice !== undefined && (speakersMap[c.speaker] || voice) !== c.dubbedVoice))}
                 redubbing={redubbing?.has(i)}
                 hideOriginal={hideOriginal}
                 onToggleReviewed={() => toggleReviewed(i)}
@@ -1115,7 +1461,7 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
                 onChange={(val) => updateCue(i, val)}
                 onFocus={beginEdit}
                 onBlur={commitEdit}
-                onSelect={() => { seek(c.start); if (refineMode) setCropIdx(i) }}
+                onSelect={() => { seek(refineMode && rightView === "source" ? (c.sourceStart ?? c.start) : c.start); if (refineMode) setCropIdx(i) }}
                 refineMode={refineMode}
                 cropTarget={refineMode && i === cropIdx}
                 speakersMap={speakersMap}
@@ -1127,9 +1473,16 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
                 }}
                 onDeleteSpeaker={(s) => setMergeModalTarget(s)}
                 onRemovePanel={() => removePanel(i)}
-                isSelected={selected.has(i)}
-                onToggleSelect={() => toggleSelect(i)}
+                onOriginalChange={(t) => updateOriginal(i, t)}
+                stale={refineMode && selectedLang !== sourceLang && (c.staleLangs || []).includes(selectedLang)}
+                sourceLang={sourceLang}
+                noCps={refineMode && selectedLang === sourceLang}
+                onDelete={() => deleteCue(i)}
               />
+              {/* Between-cue controls: insert a new cue, or merge with the next. */}
+              <CueDivider onInsert={() => insertCueAfter(i)}
+                onMerge={i < cues.length - 1 ? () => mergeAdjacent(i) : null} />
+              </div>
             ))}
             <div style={{ height: 8 }} />
           </div>
@@ -1157,7 +1510,7 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               {refineMode ? (
                 <div style={{ display: "flex", background: colors.panel2, border: `1px solid ${colors.border}`, borderRadius: radius.md, overflow: "hidden" }}>
-                  {["source", "panels", "preview"].map((v) => (
+                  {(recapMode ? ["panels", "preview"] : ["source", "panels", "preview"]).map((v) => (
                     <button key={v} onClick={() => setRightView(v)}
                       style={{ padding: "6px 12px", fontSize: fonts.sm, fontWeight: fonts.medium,
                         background: rightView === v ? colors.accent : "transparent",
@@ -1192,26 +1545,35 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
           {refineMode && (
             <div style={{ display: rightView === "panels" ? "flex" : "none", flex: 1, minHeight: 0 }}>
               <PdfReader pdfUrl={pdfPath ? mediaSrc(pdfPath) : ""} cropping={cropping} activeCue={cropIdx + 1}
-                onOpen={openPdf} onAttach={attachPanel} />
+                onOpen={openPdf} onAttach={attachPanel}
+                multi={recapMode} narrating={narrating}
+                boxesValue={recapMode ? recapBoxes : null}
+                onBoxesChange={recapMode ? setRecapBoxes : null}
+                onNarrate={(crops, status) => {
+                  if (status === "loading") { notify({ severity: "error", message: "The PDF is still loading — wait a second, then hit Narrate again." }); return }
+                  if (status === "empty") { notify({ severity: "info", message: "Draw at least one crop box first." }); return }
+                  if (!crops || !crops.length) { notify({ severity: "error", message: "Couldn't read any crops from the page — re-crop and try again." }); return }
+                  setPendingCrops(crops)
+                }} />
             </div>
           )}
 
           <div style={{ flex: 1, minHeight: 0, display: refineMode && rightView === "panels" ? "none" : "flex", flexDirection: "column", padding: 16, gap: 12, overflowY: "auto" }}>
             <div style={{ position: "relative", borderRadius: radius.md, overflow: "hidden", background: "#000", display: "flex", alignItems: "center", justifyContent: "center", minHeight: 200 }}>
-              {videoSrc ? (
+              {videoSrc || rightView === "preview" ? (
                 <>
-                  <video
+                  {videoSrc && <video
                     ref={videoRef}
                     src={videoSrc}
-                    muted={sourceVol === 0 || rightView !== "source"}
+                    muted={sourceVol === 0 || (refineMode && rightView !== "source")}
                     onLoadedMetadata={(e) => setDuration(e.target.duration || 0)}
                     onTimeUpdate={onTimeUpdate}
                     onSeeking={syncDub}
-                    onPlay={() => { setPlaying(true) }}
-                    onPause={() => { setPlaying(false) }}
+                    onPlay={() => { if (driver === "video") setPlaying(true) }}
+                    onPause={() => { if (driver === "video") { setPlaying(false); if (!refineMode) audioRef.current?.pause() } }}
                     onClick={togglePlay}
                     style={{ width: "100%", maxHeight: 360, objectFit: "contain", display: rightView === "preview" ? "none" : "block", cursor: "pointer" }}
-                  />
+                  />}
                   {rightView === "preview" && (
                     <div onClick={togglePlay} style={{ width: "100%", height: 360, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}>
                       {(() => {
@@ -1237,7 +1599,7 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
             {/* Transport controls */}
             <PlayerControls
               currentTime={currentTime}
-              duration={duration || totalTime}
+              duration={driver === "audio" ? (audioDuration || totalTime) : (duration || totalTime)}
               playing={playing}
               speed={speed}
               setSpeed={setSpeed}
@@ -1264,6 +1626,11 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
                 ref={audioRef}
                 src={`${FILES_ORIGIN}${ttsAudioUrl}`}
                 preload="auto"
+                onLoadedMetadata={(e) => setAudioDuration(e.target.duration || 0)}
+                onTimeUpdate={onAudioTime}
+                onPlay={() => { if (driver === "audio") setPlaying(true) }}
+                onPause={() => { if (driver === "audio") setPlaying(false) }}
+                onEnded={() => { if (driver === "audio") setPlaying(false) }}
                 onError={() => notify({ severity: "error", message: "Dub audio failed to load — try re-running AI Dubbing." })}
                 style={{ display: "none" }}
               />
@@ -1272,21 +1639,25 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
         </div>
       </div>
 
-      {/* Row splitter */}
-      <Splitter axis="y" onPointerDown={onRowDown} />
-
-      {/* Bottom: timeline */}
-      <Timeline
-        ref={timelineScrollRef}
-        cues={cues}
-        height={timelineH}
-        pxPerSec={pxPerSec}
-        setPxPerSec={setPxPerSec}
-        totalTime={totalTime}
-        currentTime={currentTime}
-        activeIdx={activeIdx}
-        onSeek={seek}
-      />
+      {/* Bottom: timeline — reflects the DUB timeline, so in Video Refine it only
+          shows on Preview (the tab that plays the dub). On Source you scrub the
+          video with its native transport; on Panels there's nothing to scrub. */}
+      {(!refineMode || rightView === "preview") && (
+        <>
+          <Splitter axis="y" onPointerDown={onRowDown} />
+          <Timeline
+            ref={timelineScrollRef}
+            cues={cues}
+            height={timelineH}
+            pxPerSec={pxPerSec}
+            setPxPerSec={setPxPerSec}
+            totalTime={totalTime}
+            currentTime={currentTime}
+            activeIdx={activeIdx}
+            onSeek={seek}
+          />
+        </>
+      )}
     </div>
   )
 }
@@ -1441,10 +1812,96 @@ function AddLanguageModal({ voices, existing, onClose, onAdd }) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
+   Character Registry (Recap) — the living, user-editable wiki the narrator uses
+───────────────────────────────────────────────────────────────────────────── */
+
+function CharacterRegistryModal({ registry, onClose, onSave }) {
+  const [chars, setChars] = useState(() => (registry?.characters || []).map((c) => ({ ...c })))
+  const upd = (i, field, val) => setChars((prev) => prev.map((c, k) => (k === i ? { ...c, [field]: val } : c)))
+  const updList = (i, field, val) => upd(i, field, val.split(/[;\n]/).map((s) => s.trim()).filter(Boolean))
+  const addChar = () => setChars((prev) => [...prev, { name: "", aliases: [], current_appearance: "", appearance_history: [], status: "", relationships: [] }])
+  const delChar = (i) => setChars((prev) => prev.filter((_, k) => k !== i))
+
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: "90%", maxWidth: 760, height: "85vh", background: colors.panel, border: `1px solid ${colors.border}`, borderRadius: radius.lg, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 20px", borderBottom: `1px solid ${colors.border}` }}>
+          <div>
+            <h2 style={{ color: colors.text, fontSize: fonts.xl, fontWeight: fonts.bold }}>Character Registry</h2>
+            <p style={{ color: colors.muted, fontSize: fonts.xs, marginTop: 2 }}>The narrator resolves identities from this. Fix any mistake here and every later batch inherits it.</p>
+          </div>
+          <button onClick={onClose} style={{ color: colors.muted, fontSize: 22, background: "none", border: "none", cursor: "pointer" }}>✕</button>
+        </div>
+
+        <div style={{ flex: 1, overflowY: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 14 }}>
+          {chars.length === 0 && <div style={{ color: colors.muted, textAlign: "center", padding: 30 }}>No characters yet — they're discovered as you narrate, or add one now.</div>}
+          {chars.map((c, i) => (
+            <div key={i} style={{ border: `1px solid ${colors.border}`, borderRadius: radius.md, padding: 14, background: colors.panel2, display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input value={c.name || ""} onChange={(e) => upd(i, "name", e.target.value)} placeholder="Name"
+                  style={{ flex: 1, background: colors.panel, border: `1px solid ${colors.border}`, color: colors.text, fontWeight: fonts.bold, padding: "7px 10px", borderRadius: radius.sm }} />
+                <button onClick={() => delChar(i)} title="Remove" style={{ color: colors.error, background: "none", border: "none", fontSize: 16, cursor: "pointer" }}>🗑</button>
+              </div>
+              {[["current_appearance", "Current appearance", false], ["status", "Status / what they're doing", false],
+                ["aliases", "Aliases (separate with ;)", true], ["relationships", "Relationships (separate with ;)", true]].map(([f, ph, isList]) => (
+                <input key={f} value={isList ? (c[f] || []).join("; ") : (c[f] || "")}
+                  onChange={(e) => (isList ? updList(i, f, e.target.value) : upd(i, f, e.target.value))} placeholder={ph}
+                  style={{ background: colors.panel, border: `1px solid ${colors.border}`, color: colors.text, padding: "6px 10px", borderRadius: radius.sm, fontSize: fonts.sm }} />
+              ))}
+              {(c.appearance_history || []).length > 0 && (
+                <div style={{ color: colors.muted, fontSize: fonts.xs }}>Past looks: {(c.appearance_history || []).join(" · ")}</div>
+              )}
+            </div>
+          ))}
+          <button onClick={addChar} style={{ alignSelf: "flex-start", color: colors.accent, background: "none", border: `1px dashed ${colors.border}`, borderRadius: radius.md, padding: "8px 14px", cursor: "pointer" }}>+ Add character</button>
+        </div>
+
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", padding: "14px 20px", borderTop: `1px solid ${colors.border}` }}>
+          <Button variant="secondary" onClick={onClose}>Cancel</Button>
+          <Button variant="primary" onClick={() => onSave({ characters: chars.filter((c) => (c.name || "").trim()) })}>Save registry</Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Between-cue divider — hover to insert a new cue or merge with the next one
+───────────────────────────────────────────────────────────────────────────── */
+
+const IconMerge = () => (
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M7 4l5 5 5-5M7 20l5-5 5 5" />
+  </svg>
+)
+
+function CueDivider({ onInsert, onMerge }) {
+  const [hover, setHover] = useState(false)
+  return (
+    <div onMouseEnter={() => setHover(true)} onMouseLeave={() => setHover(false)}
+      style={{ position: "relative", height: 14 }}>
+      <div style={{ position: "absolute", left: 8, right: 8, top: "50%", height: 1, background: colors.accent, opacity: hover ? 0.35 : 0, transition: "opacity .12s" }} />
+      {hover && (
+        <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)", display: "flex", gap: 6, zIndex: 6 }}>
+          <button onClick={onInsert} title="Insert a new cue here"
+            style={{ width: 22, height: 22, borderRadius: "50%", background: "#4ea1ff", color: "#fff", border: "none", fontSize: 16, lineHeight: 1, display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 1px 4px rgba(0,0,0,0.4)" }}>+</button>
+          {onMerge && (
+            <button onClick={onMerge} title="Merge these two cues"
+              style={{ width: 22, height: 22, borderRadius: "50%", background: colors.panel2, color: colors.textDim, border: `1px solid ${colors.border}`, display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 1px 4px rgba(0,0,0,0.4)" }}>
+              <IconMerge />
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
    Cue row
 ───────────────────────────────────────────────────────────────────────────── */
 
-function CueRow({ index, cue, active, reviewed, refining, dirty, redubbing, hideOriginal, onToggleReviewed, onPlay, onRefine, onRedub, onChange, onFocus, onBlur, onSelect, refineMode = false, cropTarget = false, onRemovePanel, isSelected = false, onToggleSelect, speakersMap = {}, onSpeakerChange = () => {}, onOpenSpeakerModal = () => {}, onAddSpeaker = () => {}, onDeleteSpeaker = () => {} }) {
+function CueRow({ index, cue, active, reviewed, refining, dirty, redubbing, hideOriginal, onToggleReviewed, onPlay, onRefine, onRedub, onChange, onFocus, onBlur, onSelect, refineMode = false, cropTarget = false, onRemovePanel, speakersMap = {}, onSpeakerChange = () => {}, onOpenSpeakerModal = () => {}, onAddSpeaker = () => {}, onDeleteSpeaker = () => {}, onOriginalChange = () => {}, stale = false, sourceLang = "English", noCps = false, onDelete = null }) {
   const cps = cue.cps ?? 0
   const rushed = cue.rushed ?? cps > 20
   const body = (
@@ -1463,16 +1920,25 @@ function CueRow({ index, cue, active, reviewed, refining, dirty, redubbing, hide
           onAdd={onAddSpeaker} 
           onDelete={onDeleteSpeaker} 
         />
-        <span style={{
+        {/* No CPS on the ORIGINAL language — its timeline derives FROM the audio
+            (repack), so there is no slot to fit and nothing to be "rushed" against. */}
+        {!noCps && <span style={{
           background: rushed ? "rgba(248,113,113,0.15)" : colors.panel2,
           color: rushed ? colors.error : colors.warning,
           border: `1px solid ${rushed ? colors.error : colors.border}`,
           padding: "2px 7px", borderRadius: radius.full, fontSize: 10, fontWeight: fonts.bold,
-        }}>{cps.toFixed(1)} CPS</span>
+        }}>{cps.toFixed(1)} CPS</span>}
+        {stale && (
+          <span title={`The ${sourceLang} text changed after this translation was made — re-translate this cue.`}
+            style={{ background: "rgba(251,191,36,0.15)", color: colors.warning, border: "1px solid rgba(251,191,36,0.5)",
+              padding: "2px 7px", borderRadius: radius.full, fontSize: 10, fontWeight: fonts.bold }}>
+            ⚠ {sourceLang} changed
+          </span>
+        )}
         <span style={{ color: colors.textDim, background: colors.panel2, border: `1px solid ${colors.border}`, padding: "2px 8px", borderRadius: radius.full, fontVariantNumeric: "tabular-nums" }}>
           {formatTime(cue.start)} - {formatTime(cue.end)}
         </span>
-        <button
+        {!noCps && <button
           onClick={onRefine}
           disabled={refining}
           title="AI: re-translate this line shorter to lower its CPS"
@@ -1487,7 +1953,7 @@ function CueRow({ index, cue, active, reviewed, refining, dirty, redubbing, hide
           {refining
             ? <><span style={{ width: 9, height: 9, border: "1.5px solid currentColor", borderTopColor: "transparent", borderRadius: "50%", display: "inline-block", animation: "ms-spin 0.65s linear infinite" }} /> Fixing…</>
             : "✦ AI Fix"}
-        </button>
+        </button>}
         <div style={{ flex: 1 }} />
         {(dirty || redubbing) && (
           <button onClick={onRedub} disabled={redubbing}
@@ -1503,6 +1969,11 @@ function CueRow({ index, cue, active, reviewed, refining, dirty, redubbing, hide
               : <><IconHeadphones small /> Redub</>}
           </button>
         )}
+        {onDelete && (
+          <button onClick={(e) => { e.stopPropagation(); onDelete() }} title="Delete cue"
+            className="ms-cue-del"
+            style={{ width: 22, height: 22, borderRadius: "50%", background: colors.error, color: "#fff", border: "none", fontSize: 12, lineHeight: 1, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>✕</button>
+        )}
         <IconBtn title="Play cue" onClick={onPlay}><IconHeadphones small /></IconBtn>
       </div>
 
@@ -1512,9 +1983,24 @@ function CueRow({ index, cue, active, reviewed, refining, dirty, redubbing, hide
         boxShadow: active ? `0 0 0 1px ${colors.accent}` : "none",
       }}>
         {!hideOriginal && (
-          <div style={{ padding: "10px 12px", color: colors.textDim, fontSize: fonts.base, borderBottom: `1px solid ${colors.border}` }}>
-            {cue.text}
-          </div>
+          refineMode ? (
+            // Editable ORIGINAL (refine mode): editing it flags every translated
+            // language stale for this cue — see updateOriginal in the editor.
+            <textarea
+              value={cue.text || ""}
+              onChange={(e) => onOriginalChange(e.target.value)}
+              onFocus={onFocus}
+              onBlur={onBlur}
+              onClick={(e) => e.stopPropagation()}
+              rows={1}
+              title={`Original (${sourceLang}) — editable`}
+              style={{ width: "100%", background: "transparent", border: "none", borderBottom: `1px solid ${colors.border}`, color: colors.textDim, padding: "10px 12px", fontSize: fonts.base, resize: "vertical", minHeight: 40, display: "block", fontFamily: fonts.ui }}
+            />
+          ) : (
+            <div style={{ padding: "10px 12px", color: colors.textDim, fontSize: fonts.base, borderBottom: `1px solid ${colors.border}` }}>
+              {cue.text}
+            </div>
+          )
         )}
         <textarea
           value={cue.translated || ""}
@@ -1535,8 +2021,6 @@ function CueRow({ index, cue, active, reviewed, refining, dirty, redubbing, hide
   // crop target; ✕ deletes the attached panel.
   return (
     <div style={{ display: "flex", gap: 10, alignItems: "stretch" }}>
-      <input type="checkbox" checked={isSelected} onChange={onToggleSelect} onClick={(e) => e.stopPropagation()}
-        title="Select for Combine" style={{ alignSelf: "flex-start", marginTop: 30, accentColor: colors.accent, width: 16, height: 16, flexShrink: 0 }} />
       <button onClick={onSelect} title={cropTarget ? "Crop target" : "Make this the crop target"}
         style={{ width: 70, flexShrink: 0, alignSelf: "flex-start", marginTop: 26, position: "relative",
           aspectRatio: "3 / 4", borderRadius: radius.md, overflow: "hidden", background: colors.panel2,
@@ -1761,6 +2245,18 @@ function maxTime(cues) {
 
 // Mirrors scripts/speech/cps.py: characters (trimmed) per second.
 const CPS_MAX = 20.0   // non-CJK "rushed" threshold (config.CPS_MAX)
+/** Effective speaking window for cue i. The dub engine lets audio run until the
+ *  NEXT cue starts (minus a breath), so dead air after a short slot is usable
+ *  time. Judging CPS against the raw end−start was a phantom constraint — lines
+ *  looked "stuck" at 26+ CPS when their audio actually fit fine. */
+function effDur(cues, i) {
+  const c = cues[i]
+  const dur = Math.max(0, (c.end ?? 0) - (c.start ?? 0))
+  const nxt = cues[i + 1]
+  if (!nxt) return dur
+  return Math.max(dur, (nxt.start ?? c.end ?? 0) - (c.start ?? 0) - 0.24)
+}
+
 function computeCps(text, durationSec) {
   const n = (text || "").trim().length
   return durationSec > 0 ? Math.round((n / durationSec) * 10) / 10 : 0
@@ -1865,11 +2361,15 @@ function MergeModal({ targetSpeaker, speakersMap, onMerge, onClose }) {
   )
 }
 
-function SpeakerModal({ speakersMap, setSpeakersMap, voices, onClose, onAddSpeaker }) {
-  const allSpeakers = Object.keys(speakersMap).filter(s => s !== "Speaker 0")
-  allSpeakers.sort((a, b) => parseInt(a.replace("Speaker ", "") || 0) - parseInt(b.replace("Speaker ", "") || 0))
+function SpeakerModal({ speakersMap, setSpeakersMap, voices, onClose, onAddSpeaker, defaultVoice = "" }) {
+  // Speaker 0 is the DEFAULT speaker every cue starts as — always show it first
+  // so its voice can be reassigned (e.g. off the language default onto a specific
+  // profile). Then the numbered speakers, in order.
+  const others = Object.keys(speakersMap).filter(s => s !== "Speaker 0")
+  others.sort((a, b) => parseInt(a.replace("Speaker ", "") || 0) - parseInt(b.replace("Speaker ", "") || 0))
+  const allSpeakers = ["Speaker 0", ...others]
 
-  const [activeTab, setActiveTab] = useState(allSpeakers[0] || "Speaker 1")
+  const [activeTab, setActiveTab] = useState("Speaker 0")
   const [search, setSearch] = useState("")
 
   // If no speakers exist, ensure the active tab is correctly tracked when one is added
@@ -1930,7 +2430,12 @@ function SpeakerModal({ speakersMap, setSpeakersMap, voices, onClose, onAddSpeak
         ) : (
           <>
             <div style={{ padding: "12px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${colors.border}` }}>
-              <div style={{ fontSize: fonts.base, color: colors.text }}>Assign a voice to <strong style={{color: colors.accent}}>{activeTab}</strong></div>
+              <div style={{ fontSize: fonts.base, color: colors.text }}>
+                Assign a voice to <strong style={{ color: colors.accent }}>{activeTab}</strong>
+                {activeTab === "Speaker 0" && !speakersMap["Speaker 0"] && (
+                  <span style={{ color: colors.textDim, fontSize: fonts.sm }}> — currently the language default ({defaultVoice || "none"})</span>
+                )}
+              </div>
               <input type="text" placeholder="Search for a speaker..." value={search} onChange={e => setSearch(e.target.value)}
                 style={{ background: colors.panel2, color: colors.text, border: `1px solid ${colors.border}`, padding: "8px 12px", borderRadius: radius.md, width: 250, fontSize: fonts.sm }} />
             </div>
@@ -1938,7 +2443,8 @@ function SpeakerModal({ speakersMap, setSpeakersMap, voices, onClose, onAddSpeak
             <div style={{ flex: 1, overflowY: "auto", padding: 20 }}>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 12 }}>
                 {filteredVoices.map(v => {
-                  const isActive = speakersMap[activeTab] === v.name
+                  const currentVoice = speakersMap[activeTab] || (activeTab === "Speaker 0" ? defaultVoice : "")
+                  const isActive = currentVoice === v.name
                   return (
                     <div key={v.name} onClick={() => assignVoice(v.name)}
                       style={{

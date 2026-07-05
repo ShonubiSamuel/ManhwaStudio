@@ -204,10 +204,22 @@ def call_provider(
     lm_model:       str = "",
     max_tokens:     int = 4096,
     context_length: int = lmstudio_provider.CONTEXT_LENGTH,
+    task:           str = "translate",   # translate | refine | narrate (NVIDIA model pick)
 ) -> str:
-    """Route a single prompt to the correct backend provider."""
+    """Route a single prompt to the correct backend provider.
+
+    `task` selects which per-task model to use for NVIDIA — "translate",
+    "refine" or "narrate" → nvidia_<task>_model in Settings (falls back to the
+    config default). GitHub/Groq read their own model settings.
+    """
     if provider == "lm_studio":
         return lmstudio_provider.call_text(
             prompt, lm_model, max_tokens, context_length
         )
-    return nvidia_provider.call_text(prompt, api_key, max_tokens)
+    if provider in ("github", "groq"):
+        from ai import openai_compat
+        return openai_compat.call_text(prompt, provider, max_tokens)
+    # NVIDIA: pick the per-task model chosen in Settings.
+    import runtime_settings as rs
+    nv_model = rs.get_str(f"nvidia_{task}_model", "") or config.NVIDIA_MODEL
+    return nvidia_provider.call_text(prompt, api_key, max_tokens, model=nv_model)

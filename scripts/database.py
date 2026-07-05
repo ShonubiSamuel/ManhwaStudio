@@ -198,7 +198,12 @@ CREATE INDEX IF NOT EXISTS idx_logs_episode       ON processing_logs(episode_id)
 
 class Database:
 
-    def __init__(self, db_path: str = "studio.db"):
+    def __init__(self, db_path: str | Path | None = None):
+        # Default to the ONE canonical DB at the repo root. A bare relative
+        # default used to create a stray empty studio.db in whatever the
+        # process's cwd happened to be — silently splitting the data.
+        if db_path is None:
+            db_path = Path(__file__).resolve().parent.parent / "studio.db"
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(

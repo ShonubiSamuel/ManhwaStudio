@@ -44,6 +44,14 @@ DEFAULTS: Dict[str, object] = {
     "nvidia_vision_model":      config.NVIDIA_VISION_MODEL,
     "ai_provider_translate":    "nvidia",
     "ai_provider_refine":       "nvidia",
+    "ai_provider_narrate":      "github",   # PDF panels → narration (vision; Recap)
+    "nvidia_translate_model":   config.NVIDIA_MODEL,          # NVIDIA text model for translation
+    "nvidia_refine_model":      config.NVIDIA_MODEL,          # NVIDIA text model for AI Refine (+ Recap storyteller)
+    "recap_batch_size":         "2",                          # panels per narration call (auto-capped per model)
+    "github_token":             "",         # fine-grained PAT, `models: read` scope
+    "github_model":             "openai/gpt-4o-mini",   # free-tier + vision; gpt-4.1 is gated
+    "groq_api_key":             "",
+    "groq_model":               "llama-3.3-70b-versatile",
     "nvidia_batch_size":        "30",
     "nvidia_max_concurrent":    "6",
     "lm_studio_url":            "http://localhost:1234/v1",
@@ -130,8 +138,12 @@ DEFAULTS: Dict[str, object] = {
 
 # Section grouping — six domain groups the UI renders as tabs.
 SECTIONS: Dict[str, list] = {
-    "ai_providers": ["nvidia_api_key", "nvidia_vision_model",
-                     "ai_provider_translate", "ai_provider_refine",
+    "ai_providers": ["ai_provider_translate", "nvidia_translate_model",
+                     "ai_provider_refine", "nvidia_refine_model",
+                     "ai_provider_narrate", "nvidia_vision_model", "recap_batch_size",
+                     "nvidia_api_key",
+                     "github_token", "github_model",
+                     "groq_api_key", "groq_model",
                      "nvidia_batch_size", "nvidia_max_concurrent",
                      "lm_studio_url", "lm_studio_model", "lm_studio_context_length",
                      "lm_studio_max_concurrent", "lm_studio_batch_size"],
@@ -139,7 +151,9 @@ SECTIONS: Dict[str, list] = {
                      "dots_guidance_scale", "dots_speaker_scale", "dots_seed",
                      "voice_ref_whisper_model", "tts_recommended_voice_design",
                      "tts_recommended_voice_clone", "tts_recommended_custom_voice"],
-    "detection":    [k for k in DEFAULTS if k.startswith(("detect_", "whisper_", "screenshot_"))],
+    # "detection" section removed: the video panel-detection pipeline it tuned
+    # died with the old Pipeline page. Keys stay in DEFAULTS (harmless) so any
+    # stored values are preserved if it ever comes back.
     "dubbing_sync": ["dub_max_stretch", "dub_hard_stretch", "dub_mild_stretch",
                      "dub_auto_fix_rushed", "dub_fix_attempts",
                      "translate_len_budget", "translate_len_budget_cjk",

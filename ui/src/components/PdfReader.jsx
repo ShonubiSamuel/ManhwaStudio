@@ -46,12 +46,23 @@ function PageCanvas({ doc, pageNum, scrollRef }) {
   return <canvas ref={ref} style={{ width: "100%", height: "100%", display: "block" }} />
 }
 
-function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach }) {
+// multi mode (Recap): every finished crop STAYS on the page as a numbered box,
+// stacking one under another so the whole chapter's cropping is reviewable
+// before sending; onNarrate(dataUrls) fires with every crop composited in order.
+function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach, multi = false, onNarrate = null, narrating = false, boxesValue = null, onBoxesChange = null }) {
   const [doc, setDoc] = useState(null)
   const [dims, setDims] = useState([])     // intrinsic {w,h} per page (scale 1)
   const [loading, setLoading] = useState(false)
   const [zoom, setZoom] = useState(1)
   const [box, setBox] = useState(null)     // { x,w : fraction of width ; y,h : intrinsic px in column }
+  // Committed crops. CONTROLLED when the parent passes boxesValue/onBoxesChange
+  // (Recap persists them in the session so they survive leaving/closing the app).
+  const [boxesInternal, setBoxesInternal] = useState([])
+  const controlled = multi && typeof onBoxesChange === "function"
+  const boxes = controlled ? (boxesValue || []) : boxesInternal
+  const setBoxes = controlled
+    ? (u) => onBoxesChange(typeof u === "function" ? u(boxesValue || []) : u)
+    : setBoxesInternal
   const [space, setSpace] = useState(false)
   const [panning, setPanning] = useState(false)
   const [err, setErr] = useState("")
@@ -62,7 +73,9 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach }) {
     let cancelled = false
     // Reset view for the new PDF (legitimate reset-on-input-change).
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setBox(null); setDoc(null); setDims([]); setErr(""); setLoading(!!pdfUrl)
+    // Don't wipe committed crops when controlled — the parent owns/persists them.
+    setBox(null); if (!controlled) setBoxesInternal([])
+    setDoc(null); setDims([]); setErr(""); setLoading(!!pdfUrl)
     if (!pdfUrl) return
     const task = pdfjs.getDocument({ url: pdfUrl, disableRange: false })
     task.promise.then(async (d) => {
@@ -101,51 +114,68 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach }) {
     return { x: clamp01((e.clientX - r.left) / r.width), y: clamp01((e.clientY - r.top) / r.height) }
   }
 
-  // Draw / move / resize the box across the continuous column (cross-page).
-  const begin = (e, mode, colEl) => {
+  // Draw / move / resize a box across the continuous column (cross-page).
+  //   idx <  0 → the ACTIVE (orange) box being drawn.
+  //   idx >= 0 → a COMMITTED (blue) box in `boxes` — so crops stay adjustable
+  //              after drawing (move body, drag handles) just like a fresh one.
+  const begin = (e, mode, colEl, idx = -1) => {
     if (space || e.button !== 0) return
     if (mode !== "draw") e.stopPropagation()
     const sm = normInColumn(e, colEl)
-    const sb = box ? { ...box } : null
-    // Clear existing box on tap; only start drawing a new one if dragged past a threshold.
+    const editing = idx >= 0
+    const sb = editing ? { ...boxes[idx] } : (box ? { ...box } : null)
     if (mode === "draw") setBox(null)
-    
+
+    // cur tracks the latest geometry in a plain closure var, so the commit reads
+    // it directly — NEVER call setBoxes inside a setBox updater (StrictMode
+    // double-invokes updaters, which is what made one crop count as two).
+    let cur = mode === "draw" ? null : sb
     let isDrawing = false
+    const apply = (nb) => {
+      cur = nb
+      if (editing) setBoxes((list) => list.map((b, k) => (k === idx ? nb : b)))
+      else setBox(nb)
+    }
     const mv = (ev) => {
       const m = normInColumn(ev, colEl)
       if (mode === "draw") {
-        const w = Math.abs(m.x - sm.x)
-        const h = Math.abs(m.y - sm.y)
+        const w = Math.abs(m.x - sm.x), h = Math.abs(m.y - sm.y)
         if (!isDrawing && (w > 0.005 || h > 0.005)) isDrawing = true
-        if (isDrawing) {
-          setBox({ x: Math.min(sm.x, m.x), y: Math.min(sm.y, m.y), w, h })
-        }
+        if (isDrawing) apply({ x: Math.min(sm.x, m.x), y: Math.min(sm.y, m.y), w, h })
       } else if (mode === "move" && sb) {
-        const x = Math.min(clamp01(sb.x + (m.x - sm.x)), 1 - sb.w)
-        const y = Math.min(clamp01(sb.y + (m.y - sm.y)), 1 - sb.h)
-        setBox({ ...sb, x, y })
+        apply({ ...sb,
+          x: Math.min(clamp01(sb.x + (m.x - sm.x)), 1 - sb.w),
+          y: Math.min(clamp01(sb.y + (m.y - sm.y)), 1 - sb.h) })
       } else if (sb) {
-        const h = mode.slice(7)
+        const hh = mode.slice(7)
         let L = sb.x, T = sb.y, R = sb.x + sb.w, B = sb.y + sb.h
-        if (h.includes("w")) L = m.x; if (h.includes("e")) R = m.x
-        if (h.includes("n")) T = m.y; if (h.includes("s")) B = m.y
-        setBox({ x: Math.min(L, R), y: Math.min(T, B), w: Math.abs(R - L), h: Math.abs(B - T) })
+        if (hh.includes("w")) L = m.x; if (hh.includes("e")) R = m.x
+        if (hh.includes("n")) T = m.y; if (hh.includes("s")) B = m.y
+        apply({ x: Math.min(L, R), y: Math.min(T, B), w: Math.abs(R - L), h: Math.abs(B - T) })
       }
     }
-    const up = () => { window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up) }
+    const up = () => {
+      window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up)
+      // Multi mode: a finished DRAW commits the crop into `boxes` (once).
+      if (multi && mode === "draw") {
+        if (cur && cur.w > 0.005 && cur.h > 0.002) setBoxes((list) => [...list, cur])
+        setBox(null)
+      }
+    }
     window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up)
   }
 
-  // Composite the crop from every page the box overlaps (re-rendered crisp).
+  // Composite the crop from every page a box overlaps (re-rendered crisp).
   // Everything is in "units of one column width"; the box's y/h are fractions of
   // the whole column (geo.total units).
-  const cropToDataUrl = async () => {
-    if (!doc || !box || box.w < 0.005 || box.h < 0.002) return null
+  const cropToDataUrl = async (bArg) => {
+    const b0 = bArg || box
+    if (!doc || !b0 || b0.w < 0.005 || b0.h < 0.002) return null
     const cs = 2                                    // render quality (× intrinsic)
-    const yU0 = box.y * geo.total, yU1 = (box.y + box.h) * geo.total   // in units
+    const yU0 = b0.y * geo.total, yU1 = (b0.y + b0.h) * geo.total   // in units
     const refW = dims[0]?.w || 1
-    const outW = Math.max(1, Math.round(box.w * refW * cs))
-    const pxPerUnit = outW / box.w                  // output px for one column width
+    const outW = Math.max(1, Math.round(b0.w * refW * cs))
+    const pxPerUnit = outW / b0.w                  // output px for one column width
     const out = document.createElement("canvas")
     out.width = outW
     out.height = Math.max(1, Math.round((yU1 - yU0) * pxPerUnit))
@@ -159,8 +189,8 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach }) {
       const vp = page.getViewport({ scale: cs })
       const tmp = document.createElement("canvas"); tmp.width = vp.width; tmp.height = vp.height
       await page.render({ canvasContext: tmp.getContext("2d"), viewport: vp }).promise
-      const sx = box.x * dims[i].w * cs
-      const sw = box.w * dims[i].w * cs
+      const sx = b0.x * dims[i].w * cs
+      const sw = b0.w * dims[i].w * cs
       const sy = a * dims[i].w * cs                 // a units × page-width px (= intrinsic y)
       const sh = (b - a) * dims[i].w * cs
       const dh = (b - a) * pxPerUnit
@@ -175,6 +205,28 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach }) {
     if (!data) return
     const ok = await onAttach(data)
     if (ok) setBox(null)
+  }
+
+  // Multi mode: composite every committed crop (top-to-bottom order) and hand
+  // the stack to the parent (which saves panels + narrates in batches).
+  const narrateAll = async () => {
+    if (!onNarrate) return
+    // The PDF must be fully parsed to composite crops. After reopening the app
+    // the persisted boxes can paint a frame before doc/dims finish loading.
+    if (!doc || dims.length === 0) { onNarrate([], "loading"); return }
+    if (!boxes.length) { onNarrate([], "empty"); return }
+    const ordered = [...boxes].sort((a, b) => a.y - b.y)
+    const crops = []
+    for (const b of ordered) {
+      try {
+        const data = await cropToDataUrl(b)
+        if (data && data.length > 200) crops.push({ data, box: b })   // skip degenerate/empty
+        else console.warn("[recap] crop produced no data", b)
+      } catch (e) {
+        console.error("[recap] crop failed", b, e)
+      }
+    }
+    onNarrate(crops, crops.length ? "ok" : "failed")
   }
 
   // Keyboard: A attach · Space pan · arrows nudge.
@@ -284,9 +336,20 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach }) {
         <IconBtn onClick={() => zoomBtn(1.2)}>+</IconBtn>
         <IconBtn onClick={() => setZoom(1)} title="Reset zoom">⊡</IconBtn>
         {box && <IconBtn onClick={() => setBox(null)} title="Clear box">✕</IconBtn>}
-        <Button variant="primary" disabled={cropping || !box} loading={cropping} onClick={attach} style={{ borderRadius: radius.md }}>
-          {cropping ? "Saving…" : `Attach to cue ${activeCue}  (A)`}
-        </Button>
+        {multi ? (
+          <>
+            <span style={{ color: colors.textDim, fontSize: fonts.sm }}>{boxes.length} crop{boxes.length === 1 ? "" : "s"}</span>
+            {boxes.length > 0 && <IconBtn onClick={() => setBoxes([])} title="Clear all crops">🗑</IconBtn>}
+            <Button variant="primary" disabled={narrating || !boxes.length} loading={narrating}
+              onClick={narrateAll} style={{ borderRadius: radius.md }}>
+              {narrating ? "Narrating…" : `🪄 Narrate ${boxes.length || ""} crop${boxes.length === 1 ? "" : "s"}`}
+            </Button>
+          </>
+        ) : (
+          <Button variant="primary" disabled={cropping || !box} loading={cropping} onClick={attach} style={{ borderRadius: radius.md }}>
+            {cropping ? "Saving…" : `Attach to cue ${activeCue}  (A)`}
+          </Button>
+        )}
       </div>
 
       <div ref={scrollRef} onMouseDown={startPanOrDraw}
@@ -322,9 +385,35 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach }) {
                 </div>
               )
             })}
+            {/* Committed crops (multi mode): numbered by reading order, and still
+                fully adjustable — drag the body to move, drag a handle to resize,
+                ✕ to remove. They never disappear, so the whole chapter's cropping
+                stays reviewable. Rank (number) is by vertical position. */}
+            {multi && boxes.map((b, realIdx) => {
+              const rank = boxes.filter((o) => o.y < b.y || (o.y === b.y && boxes.indexOf(o) <= realIdx)).length
+              return (
+                <div key={realIdx}
+                  onMouseDown={(e) => begin(e, "move", e.currentTarget.parentElement, realIdx)}
+                  style={{ position: "absolute", left: b.x * displayW, top: b.y * colH, width: b.w * displayW, height: b.h * colH,
+                    border: "2px solid #4ea1ff", background: "rgba(78,161,255,0.10)", zIndex: 1, cursor: space ? "inherit" : "move" }}>
+                  <span style={{ position: "absolute", top: -1, left: -1, background: "#4ea1ff", color: "#000", fontSize: 11, fontWeight: 700, padding: "1px 7px", borderRadius: "0 0 6px 0" }}>{rank}</span>
+                  <button onMouseDown={(e) => { e.stopPropagation(); e.preventDefault(); setBoxes((list) => list.filter((_, k) => k !== realIdx)) }}
+                    title="Remove this crop"
+                    style={{ position: "absolute", top: 2, right: 2, width: 18, height: 18, borderRadius: "50%", background: "rgba(0,0,0,0.65)", color: "#fff", fontSize: 11, lineHeight: "18px" }}>✕</button>
+                  {!space && HANDLES.map((h) => (
+                    <div key={h} onMouseDown={(e) => begin(e, `resize-${h}`, e.currentTarget.parentElement.parentElement, realIdx)}
+                      style={{
+                        position: "absolute", width: 12, height: 12, background: "#4ea1ff", border: "1px solid #fff", borderRadius: 2, cursor: HCURSOR[h],
+                        left: h.includes("w") ? -6 : h.includes("e") ? "calc(100% - 6px)" : "calc(50% - 6px)",
+                        top: h.includes("n") ? -6 : h.includes("s") ? "calc(100% - 6px)" : "calc(50% - 6px)",
+                      }} />
+                  ))}
+                </div>
+              )
+            })}
             {box && (
               <div onMouseDown={(e) => begin(e, "move", e.currentTarget.parentElement)}
-                style={{ position: "absolute", left: box.x * displayW, top: box.y * colH, width: box.w * displayW, height: box.h * colH, border: `2px solid ${colors.accent}`, background: "rgba(255,107,53,0.12)", boxShadow: "0 0 0 9999px rgba(0,0,0,0.45)", cursor: space ? "inherit" : "move", zIndex: 2 }}>
+                style={{ position: "absolute", left: box.x * displayW, top: box.y * colH, width: box.w * displayW, height: box.h * colH, border: `2px solid ${colors.accent}`, background: "rgba(255,107,53,0.12)", boxShadow: multi ? "none" : "0 0 0 9999px rgba(0,0,0,0.45)", cursor: space ? "inherit" : "move", zIndex: 2 }}>
                 {!space && HANDLES.map((h) => (
                   <div key={h} onMouseDown={(e) => begin(e, `resize-${h}`, e.currentTarget.parentElement.parentElement)}
                     style={{

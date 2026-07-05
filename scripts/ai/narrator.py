@@ -267,7 +267,7 @@ def narrate_with_vision(
     should_stop: Optional[Callable[[], bool]] = None,
 ) -> List[str]:
     """
-    PDF narration via NVIDIA Llama 3.2 90B Vision.
+    PDF narration via the configured NVIDIA vision model.
     Sends panel images in batches of batch_size.
     Returns list of N narration strings (one per panel image).
 
@@ -297,7 +297,7 @@ def narrate_with_vision(
     _RETRY_DELAYS = (2, 5, 15)
 
     log(
-        f"Narrating {n} panel(s) via Llama 3.2 Vision "
+        f"Narrating {n} panel(s) via the vision model "
         f"({n_batches} batch(es) of ≤{batch_size}) …",
         "info",
     )

@@ -17,6 +17,7 @@ const NAV = [
   { page: PAGES.SUBTITLE,      label: "Subtitle",      icon: "▭" },
   { page: PAGES.VOICEOVER,     label: "Voiceover",     icon: "🎙" },
   { page: PAGES.VIDEO_REFINE,  label: "Video Refine",  icon: "🖼" },
+  { page: PAGES.RECAP,         label: "Recap",         icon: "🪄" },
   { page: PAGES.REALTIME,      label: "Real-Time",     icon: "◉" },
   { page: PAGES.VOICES,        label: "Voices",        icon: "♪" },
   { page: PAGES.SETTINGS,      label: "Settings",      icon: "⚙" },

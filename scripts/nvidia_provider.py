@@ -1,7 +1,8 @@
 """
 nvidia_provider.py — ManhwaStudio v2
 ─────────────────────────────────────────────────────────────────────────────
-NVIDIA NIM API backend — Llama 3.3 70B text + Llama 3.2 90B Vision.
+NVIDIA NIM API backend — OpenAI-compatible text + vision calls.
+Models are chosen per task in Settings (see ai/model_caps.py).
 
 Free tier facts
 ───────────────
@@ -43,6 +44,7 @@ def call_text(
     prompt:     str,
     api_key:    str,
     max_tokens: int = MAX_TOKENS,
+    model:      str = "",
 ) -> str:
     """
     Single NVIDIA NIM text-model call (Llama 3.3 70B).
@@ -58,7 +60,8 @@ def call_text(
     import logging
     logger = logging.getLogger(__name__)
     start_time = time.time()
-    logger.info(f"Requesting text model {config.NVIDIA_MODEL} (prompt: {len(prompt)} chars)...")
+    model = model or config.NVIDIA_MODEL
+    logger.info(f"Requesting text model {model} (prompt: {len(prompt)} chars)...")
 
     from openai import OpenAI
 
@@ -71,7 +74,7 @@ def call_text(
     
     try:
         completion = client.chat.completions.create(
-            model       = config.NVIDIA_MODEL,
+            model       = model,
             messages    = [{"role": "user", "content": prompt}],
             temperature = 0.2,
             top_p       = 0.7,
@@ -96,9 +99,10 @@ def call_vision(
     prompt:     str,
     api_key:    str,
     max_tokens: int = 2048,
+    model:      str = "",
 ) -> str:
     """
-    Single NVIDIA NIM vision-model call (Llama 3.2 90B Vision).
+    Single NVIDIA NIM vision-model call (model chosen per task in Settings).
 
     images_b64: list of (mime_type, base64_data) tuples — all images are
     sent in one message content array alongside the text prompt.
@@ -109,7 +113,8 @@ def call_vision(
     import logging
     logger = logging.getLogger(__name__)
     start_time = time.time()
-    logger.info(f"Requesting vision model {config.NVIDIA_VISION_MODEL} ({len(images_b64)} images, prompt: {len(prompt)} chars)...")
+    model = model or config.NVIDIA_VISION_MODEL
+    logger.info(f"Requesting vision model {model} ({len(images_b64)} images, prompt: {len(prompt)} chars)...")
 
     from openai import OpenAI
 
@@ -128,7 +133,7 @@ def call_vision(
 
     try:
         completion = client.chat.completions.create(
-            model       = config.NVIDIA_VISION_MODEL,
+            model       = model,
             messages    = [{"role": "user", "content": content}],
             temperature = 0.2,
             top_p       = 0.7,

@@ -76,8 +76,19 @@ def translate_cues(
     workers = max(1, rs.get_int("nvidia_max_concurrent", 6) if provider == "nvidia"
                   else rs.get_int("lm_studio_max_concurrent", 4))
 
-    def _is_rushed(cue, tr):
-        d = float(cue["end"]) - float(cue["start"])
+    def _eff_dur(n):
+        """EFFECTIVE speaking window for cue n: the dub engine lets audio run
+        until the NEXT cue starts (minus a breath), so trailing dead air is
+        usable time. Judging CPS against the raw end−start flags cues as rushed
+        that actually fit fine — then wastes shorten calls fighting a phantom."""
+        cue = cues[n]
+        raw = max(0.0, float(cue["end"]) - float(cue["start"]))
+        if n + 1 < len(cues):
+            return max(raw, float(cues[n + 1]["start"]) - float(cue["start"]) - 0.24)
+        return raw
+
+    def _is_rushed(n, tr):
+        d = _eff_dur(n)
         t = (tr or "").strip()
         return d > 0 and t and cps.is_rushed(t, d, lang_code)
 
@@ -86,31 +97,43 @@ def translate_cues(
         return abs(cps.cps_of(text, dur) - comf)
 
     def _fit_one(n, cue, tr):
-        dur  = float(cue["end"]) - float(cue["start"])
+        dur  = _eff_dur(n)
         best = (tr or "").strip()
-        if _is_rushed(cue, tr):
+        if _is_rushed(n, tr):
             t0 = time.time()
             target, start_cps = cps.target_chars(dur, lang_code), cps.cps_of(best, dur)
+            history = []          # real candidates + their measured CPS → each retry learns
             for attempt in range(max(0, fix_attempts)):
                 cand = (translator.shorten_line(
                     cue["text"], best, target, lang_code,
                     provider=provider, api_key=api_key,
                     lm_studio_model=lm_studio_model, context_length=context_length,
-                    on_log=lambda *a, **k: None, # suppress internal API error logs from cluttering
+                    on_log=lambda m, lvl="muted": log(f"    ↳ cue {n + 1:02d}: {m}", "warning"),
+                    attempts=history, comf=comf,
                 ) or "").strip()
-                
-                cand_cps = cps.cps_of(cand, dur) if cand else 0.0
+
+                if not cand:
+                    # Empty = the provider failed (usually a rate limit with this
+                    # many parallel calls). Back off and retry instead of burning
+                    # the attempt on a "0.0 CPS" no-op.
+                    log(f"    ↳ cue {n + 1:02d} attempt {attempt + 1}: provider returned nothing "
+                        f"(rate-limited?) — backing off {2 * (attempt + 1)}s", "warning")
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+
+                cand_cps = cps.cps_of(cand, dur)
+                history.append({"text": cand, "cps": cand_cps})
                 log(f"    ↳ cue {n + 1:02d} attempt {attempt + 1}: returned {cand_cps:.1f} CPS", "muted")
 
                 # Keep the BEST FIT (closest to the comfortable CPS), not the
                 # smallest — over-shortening just trades speed-up for silence.
-                if cand and _fit_score(cand, dur) < _fit_score(best, dur):
+                if _fit_score(cand, dur) < _fit_score(best, dur):
                     best = cand
                 if not cps.is_rushed(best, dur, lang_code):
                     log(f"    ↳ cue {n + 1:02d} successfully shortened below limit!", "success")
                     break
                 target = int(target * 0.9)
-                
+
             log(f"  cue {n + 1:02d} finished shortening {start_cps:.1f}→{cps.cps_of(best, dur):.1f} CPS "
                 f"in {time.time() - t0:.1f}s", "muted" if cps.is_rushed(best, dur, lang_code) else "success")
         c = dict(cue)
@@ -119,8 +142,8 @@ def translate_cues(
         c["rushed"]     = bool(dur > 0 and cps.is_rushed(best, dur, lang_code))
         return n, c
 
-    n_rushed = sum(1 for cue, tr in zip(cues, translations) if _is_rushed(cue, tr))
-    log(f"  CPS-fit: {n_rushed} rushed cue(s) → shortening in parallel (≤{workers} at once) …", "info")
+    n_rushed = sum(1 for n, tr in enumerate(translations) if _is_rushed(n, tr))
+    log(f"  CPS-fit: {n_rushed} rushed cue(s) (effective-window) → shortening in parallel (≤{workers} at once) …", "info")
 
     out: List[dict] = [None] * len(cues)
     fit_t0 = time.time()

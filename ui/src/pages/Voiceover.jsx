@@ -10,7 +10,7 @@
  */
 
 import { useState, useEffect, useMemo } from "react"
-import { useApp, actions } from "../store/app"
+import { useApp, actions, PAGES } from "../store/app"
 import { useNotify } from "../store/notify"
 import { listVoiceoverProjects, saveDubSession } from "../api/speech"
 import { createProject, deleteProject } from "../api/projects"
@@ -20,12 +20,15 @@ import { ProjectDubStudio } from "./DubStudio"
 
 export default function Voiceover() {
   const { state, dispatch } = useApp()
-  const pid = state.activeProjectId
+  // Only render the editor for a project THIS section opened. A legacy null
+  // section (older sessions) also counts as Voiceover so nothing regresses.
+  const owns = state.activeProjectSection === PAGES.VOICEOVER || state.activeProjectSection == null
+  const pid = owns ? state.activeProjectId : null
 
   if (pid != null) {
     return <ProjectDubStudio key={pid} projectId={pid} onBack={() => dispatch(actions.setProject(null))} />
   }
-  return <VoiceoverHome onOpen={(id) => dispatch(actions.setProject(id))} />
+  return <VoiceoverHome onOpen={(id) => dispatch(actions.setProject(id, PAGES.VOICEOVER))} />
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────

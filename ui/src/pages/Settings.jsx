@@ -35,9 +35,42 @@ const FIELDS = {
     label: "NVIDIA API Key", type: "password",
     hint: "Get a key at build.nvidia.com → any model card → Get API Key",
   },
+  ai_provider_narrate: {
+    label: "Narration Provider (Recap vision)", type: "select",
+    options: [["github", "GitHub Models"], ["nvidia", "NVIDIA (cloud)"]],
+    hint: "Turns cropped manga panels into narration (needs a vision model)",
+  },
+  nvidia_translate_model: {
+    label: "› NVIDIA Translation Model", type: "text",
+    hint: "Model used when Translation Provider = NVIDIA (e.g. meta/llama-3.1-70b-instruct)",
+  },
+  nvidia_refine_model: {
+    label: "› NVIDIA Refine Model", type: "text",
+    hint: "Model used when Refine Provider = NVIDIA (e.g. meta/llama-3.3-70b-instruct)",
+  },
+  github_token: {
+    label: "GitHub Models Token", type: "password",
+    hint: "Fine-grained PAT with the `models: read` scope — github.com/settings/tokens",
+  },
+  github_model: {
+    label: "GitHub Model", type: "text",
+    hint: "openai/gpt-4o-mini works on the free tier (gpt-4.1 is often gated → 403). Browse github.com/marketplace/models",
+  },
+  groq_api_key: {
+    label: "Groq API Key", type: "password",
+    hint: "console.groq.com → API Keys",
+  },
+  groq_model: {
+    label: "Groq Model", type: "text",
+    hint: "e.g. llama-3.3-70b-versatile",
+  },
   nvidia_vision_model: {
-    label: "NVIDIA Vision Model", type: "text",
-    hint: "Used for PDF panel narration",
+    label: "› NVIDIA Narration (Vision) Model", type: "text",
+    hint: "Model used when Narration Provider = NVIDIA (must be multimodal, e.g. moonshotai/kimi-k2.6)",
+  },
+  recap_batch_size: {
+    label: "Recap panels per call", type: "number", min: 1, max: 8,
+    hint: "How many panels the Recap sends to the vision model at once (auto-capped to the model's real limit — a 1-image model drops to 1). Fewer = more detail per panel.",
   },
   nvidia_batch_size: {
     label: "NVIDIA Batch Size", type: "number", min: 1, max: 100,
@@ -117,11 +150,11 @@ const FIELDS = {
   // ── AI providers (per-task) ───────────────────────────────────────────────
   ai_provider_translate: {
     label: "Translation Provider", type: "select",
-    options: [["nvidia", "NVIDIA (cloud)"], ["lm_studio", "LM Studio (local)"]],
+    options: [["nvidia", "NVIDIA (cloud)"], ["github", "GitHub Models"], ["groq", "Groq"], ["lm_studio", "LM Studio (local)"]],
   },
   ai_provider_refine: {
-    label: "Refine / Narration Provider", type: "select",
-    options: [["nvidia", "NVIDIA (cloud)"], ["lm_studio", "LM Studio (local)"]],
+    label: "Refine Provider", type: "select",
+    options: [["nvidia", "NVIDIA (cloud)"], ["github", "GitHub Models"], ["groq", "Groq"], ["lm_studio", "LM Studio (local)"]],
   },
 
   // ── Voices & TTS ──────────────────────────────────────────────────────────
@@ -225,17 +258,16 @@ function TTS_MODEL_OPTIONS() {
 const SECTION_LABELS = {
   ai_providers: "AI & Providers",
   voices_tts:   "Voices & TTS",
-  detection:    "Detection",
   dubbing_sync: "Dubbing & Sync",
   pdf_import:   "PDF Import",
   advanced:     "Advanced",
 }
 
-const SECTION_ORDER = ["ai_providers", "voices_tts", "detection", "dubbing_sync", "pdf_import", "advanced"]
+const SECTION_ORDER = ["ai_providers", "voices_tts", "dubbing_sync", "pdf_import", "advanced"]
 
 // Short labels shown when the settings rail is collapsed.
 const SECTION_ABBR = {
-  ai_providers: "AI", voices_tts: "TTS", detection: "DET",
+  ai_providers: "AI", voices_tts: "TTS",
   dubbing_sync: "DUB", pdf_import: "PDF", advanced: "ADV",
 }
 

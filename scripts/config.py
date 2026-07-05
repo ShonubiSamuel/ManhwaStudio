@@ -41,7 +41,7 @@ LOGS_DIR   = BASE_DIR / "logs"
 # Get a key at: https://build.nvidia.com → any model card → Get API Key
 NVIDIA_BASE_URL     = "https://integrate.api.nvidia.com/v1"
 NVIDIA_MODEL        = "meta/llama-3.1-70b-instruct"          # text: clean / translate
-NVIDIA_VISION_MODEL = "meta/llama-3.2-90b-vision-instruct"   # PDF narration (vision)
+NVIDIA_VISION_MODEL = "moonshotai/kimi-k2.6"   # narration (multimodal: text+image)
 
 
 # ── TTS backend selection ──────────────────────────────────────────────────────
@@ -296,7 +296,20 @@ CPS_MAX             = 20.0   # above this a cue is "rushed" and gets shortened
 DUB_SPEECH_MAX_STRETCH = 1.3
 # Clean gap (seconds) kept between one cue's end and the next cue's start, so a
 # line can never bleed onto the next (overlap = two voices = a "broken" sound).
-DUB_SPEECH_MIN_GAP = 0.06
+# 0.24s ≈ a natural breath — 0.06s made the next line "pick up" shockingly fast.
+DUB_SPEECH_MIN_GAP = 0.24
+
+# ── Contiguous-cue grouping (flow) ────────────────────────────────────────────
+# Back-to-back cues (tiny source gap) are synthesized TOGETHER in one generation
+# so the model speaks them as one flowing passage — real cross-sentence prosody
+# instead of N prosodic islands each ending on a "full stop" melody. The group is
+# placed as ONE clip spanning the combined slot, so it never needs re-splitting
+# (no forced alignment, no drift). Cues with real gaps stay per-cue — the gap
+# itself masks the seam there.
+DUB_GROUP_ENABLE    = True
+DUB_GROUP_MAX_GAP   = 0.40   # join cues whose source gap is under this (s)
+DUB_GROUP_MAX_CUES  = 3      # cap per group (keeps internal timing drift small)
+DUB_GROUP_MAX_CHARS = 280    # cap joined text length per generation
 
 # ── Breathing room (reduce long silences WITHOUT stretching the speech) ───────
 # A line shorter than its slot leaves dead air. Instead of slowing the voice

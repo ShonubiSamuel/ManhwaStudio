@@ -160,7 +160,7 @@ def _translate_batch_raw(
         f"{json.dumps(items, indent=2, ensure_ascii=False)}"
         )
 
-    _RETRYABLE    = ("connection", "timeout", "429", "rate", "503", "502", "500")
+    _RETRYABLE    = ("connection", "timeout", "timed out", "429", "rate", "503", "502", "500")
     _RETRY_DELAYS = (2, 5, 15)
     response  = ""
     _last_exc: Optional[Exception] = None
@@ -302,6 +302,42 @@ def _translate_batch_raw(
 
 # ── Public: condense one line to a character target (fix loop) ────────────────
 
+def _attempts_block(attempts: list, comf: float, direction: str) -> str:
+    """Show the model its OWN earlier tries with their measured speaking rate, so
+    each retry learns from the misses instead of re-rolling the same length.
+    direction: 'shorter' (still too fast) or 'longer' (still leaving dead air)."""
+    if not attempts:
+        return ""
+    rows = "\n".join(f"  {k + 1}. ({a['cps']:.1f} chars/sec) {a['text']}"
+                     for k, a in enumerate(attempts))
+    tgt = f" The target speaking rate is ≈{comf:.0f} chars/sec." if comf else ""
+    need = ("clearly FEWER characters than every attempt above"
+            if direction == "shorter" else
+            "clearly MORE characters than every attempt above")
+    return (
+        f"\nYour previous attempts MISSED — here they are with their measured speaking rate:{tgt}\n"
+        f"{rows}\n"
+        f"Study them: write a NEW sentence with {need}. Do NOT repeat or lightly reword "
+        f"any attempt above — restructure the sentence instead.\n"
+    )
+
+
+def _clean_line_response(resp: str) -> str:
+    """Normalize a one-line rewrite response (fences, JSON wraps, labels, quotes)."""
+    txt = strip_thinking_blocks(resp)
+    txt = strip_markdown_fences(txt).strip()
+    if txt[:1] in ("[", "{"):
+        try:
+            txt = _coerce_translation(json.loads(extract_json_array(txt)
+                                                 if txt[0] == "[" else txt))
+        except Exception:
+            pass
+    txt = txt.strip().strip('"').strip()
+    if "\n" in txt:
+        txt = txt.split("\n")[0].strip()        # keep the first line only
+    return txt
+
+
 def shorten_line(
     english:         str,
     current:         str,
@@ -313,6 +349,8 @@ def shorten_line(
     context_length:  int = lmstudio_provider.CONTEXT_LENGTH,
     on_log:          Callable = None,
     raise_on_error:  bool = False,
+    attempts:        list = None,     # [{"text": str, "cps": float}] earlier tries
+    comf:            float = None,    # comfortable chars/sec (for the history block)
 ) -> str:
     """
     Re-translate ONE line shorter — used by the per-panel "fix rushed" loop.
@@ -321,6 +359,9 @@ def shorten_line(
     core meaning and key story beats of the English (rephrase freely, drop only
     filler — never a vague fragment).  Returns "" on failure so the caller can
     keep the previous best.
+
+    attempts: earlier candidates with their measured CPS — included in the prompt
+    so each retry beats the previous misses instead of re-rolling the same length.
 
     raise_on_error=True re-raises provider/network failures instead of swallowing
     them — used by the interactive "AI Fix" button so the UI can tell the user the
@@ -336,7 +377,8 @@ def shorten_line(
         f"English. Use concise phrasing and contractions, and drop only filler — aim for roughly "
         f"{target} characters, but KEEPING THE MEANING MATTERS MORE THAN THE EXACT NUMBER.\n"
         f"Return a COMPLETE, natural {lang_name} sentence — never a short vague fragment, never "
-        f"empty, never just one or two words. It must still convey what the English says.\n\n"
+        f"empty, never just one or two words. It must still convey what the English says.\n"
+        f"{_attempts_block(attempts, comf, 'shorter')}\n"
         f"English: {english}\n"
         f"Too-long {lang_name}: {current}\n\n"
         f"Return ONLY the rewritten {lang_name} sentence as plain text — no quotes, no JSON, no notes."
@@ -351,20 +393,57 @@ def shorten_line(
         if raise_on_error:
             raise
         return ""
-    txt = strip_thinking_blocks(resp)
-    txt = strip_markdown_fences(txt).strip()
-    # Tolerate a JSON-ish wrap (["..."] or {"text": "..."}).
-    if txt[:1] in ("[", "{"):
-        try:
-            txt = _coerce_translation(json.loads(extract_json_array(txt)
-                                                 if txt[0] == "[" else txt))
-        except Exception:
-            pass
-    # Strip a leading "Label:" the model sometimes prepends, then quotes.
-    txt = txt.strip().strip('"').strip()
-    if "\n" in txt:
-        txt = txt.split("\n")[0].strip()        # keep the first line only
-    return txt
+    return _clean_line_response(resp)
+
+
+def expand_line(
+    english:         str,
+    current:         str,
+    target_chars:    int,
+    lang_code:       str,
+    provider:        str = "nvidia",
+    api_key:         str = "",
+    lm_studio_model: str = "",
+    context_length:  int = lmstudio_provider.CONTEXT_LENGTH,
+    on_log:          Callable = None,
+    raise_on_error:  bool = False,
+    attempts:        list = None,
+    comf:            float = None,
+) -> str:
+    """
+    The inverse of shorten_line: the {lang} line is too SHORT for its slot and
+    leaves dead air before the next cue. Rewrite it LONGER — richer, fuller
+    natural phrasing that stretches toward ~target_chars — WITHOUT inventing new
+    facts or story beats (only texture the English already implies: tone,
+    connective flow, natural emphasis). Returns "" on failure.
+    """
+    log       = on_log or print
+    lang_name = config.SUPPORTED_LANGUAGES.get(lang_code, lang_code.upper())
+    target    = max(1, int(target_chars))
+    prompt = (
+        f"You are a professional {lang_name} dubbing translator.\n"
+        f"The {lang_name} line below is too SHORT for its time slot — spoken aloud it ends early "
+        f"and leaves awkward dead air. Rewrite it LONGER and more flowing, aiming for roughly "
+        f"{target} characters, so it fills the slot naturally.\n"
+        f"STRICT RULE: do NOT invent new facts, names, events, or story beats. Only expand with "
+        f"what the English already implies — fuller phrasing, natural connectives, tone and "
+        f"emphasis. It must stay a faithful {lang_name} rendering of the English.\n"
+        f"{_attempts_block(attempts, comf, 'longer')}\n"
+        f"English: {english}\n"
+        f"Too-short {lang_name}: {current}\n\n"
+        f"Return ONLY the rewritten {lang_name} sentence as plain text — no quotes, no JSON, no notes."
+    )
+    try:
+        resp = call_provider(
+            prompt, provider=provider, api_key=api_key,
+            lm_model=lm_studio_model, max_tokens=1024, context_length=context_length,
+        )
+    except Exception as exc:
+        log(f"  expand_line error: {exc}", "muted")
+        if raise_on_error:
+            raise
+        return ""
+    return _clean_line_response(resp)
 
 
 # ── Internal: shared parallel execution pool ──────────────────────────────────

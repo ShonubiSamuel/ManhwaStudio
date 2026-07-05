@@ -562,6 +562,36 @@ def _level_clip(path: str, target_rms: float = 0.08, max_gain: float = 4.0):
     sf.write(path, y.astype("float32"), sr, subtype="PCM_16")
 
 
+def _dub_groups(cues: list, default_voice: str) -> list:
+    """Deterministically partition cues into contiguous groups for synthesis.
+
+    Back-to-back cues (same voice, source gap < DUB_GROUP_MAX_GAP) are spoken in
+    ONE generation for real cross-sentence prosody. Deterministic on the cue list
+    alone, so dub and redub always agree on the grouping. Returns [[idx, ...], …].
+    """
+    if not bool(getattr(config, "DUB_GROUP_ENABLE", True)):
+        return [[i] for i in range(len(cues))]
+    max_gap   = float(getattr(config, "DUB_GROUP_MAX_GAP", 0.40))
+    max_cues  = int(getattr(config, "DUB_GROUP_MAX_CUES", 3))
+    max_chars = int(getattr(config, "DUB_GROUP_MAX_CHARS", 280))
+    groups, cur, cur_chars = [], [], 0
+    for i, c in enumerate(cues):
+        text = (c.get("translated") or "").strip()
+        if cur:
+            prev = cues[cur[-1]]
+            gap = float(c.get("start", 0)) - float(prev.get("end", 0))
+            same_voice = (c.get("voice") or default_voice) == (prev.get("voice") or default_voice)
+            if (same_voice and 0 <= gap < max_gap and len(cur) < max_cues
+                    and cur_chars + len(text) <= max_chars):
+                cur.append(i); cur_chars += len(text)
+                continue
+            groups.append(cur)
+        cur, cur_chars = [i], len(text)
+    if cur:
+        groups.append(cur)
+    return groups
+
+
 def _run_dub_cues(job_id: str, req: DubCuesRequest):
     from tts import synth
     from tts.voice_profile import VoiceProfileManager
@@ -609,37 +639,50 @@ def _run_dub_cues(job_id: str, req: DubCuesRequest):
         # general fix, not just for cue 1. Tune DUB_WARMUP_WORD to taste.
         per_cue   = bool(getattr(config, "DUB_WARMUP_PER_CUE", False))
         warm_word = (getattr(config, "DUB_WARMUP_WORD", "Bon.") or "").strip()
-        segments_by_voice = {}
-        for i, c in enumerate(cues):
-            voice_name = c.get("voice") or req.voice
-            text = (c.get("translated") or "").strip()
-            start = float(c.get("start", 0)); end = float(c.get("end", 0))
-            nxt = float(cues[i + 1]["start"]) if i + 1 < len(cues) else end
-            slot = max(0.05, nxt - start)
-            est = (len(text) / comf) if comf else 0.0       # expected speech seconds
-            # Say the whole line as ONE clip so its comma pause is the AI's own
-            # natural pause (like Maestra), NOT a gap our code inserts between two
-            # split halves — that inserted gap was the long, unnatural silence.
-            # Slot-filling is handled by breathing (lengthening the real pause).
-            parts = [text]
-            for s, part in enumerate(parts):
-                seg = {"cue": i, "sub": s, "nsub": len(parts), "text": part,
-                       "path": str(work / f"cue_{i:04d}_{s}.wav"), "slot": slot, "start": start, "next": nxt}
-                # Warm the model up INSIDE the first clip's OWN generation, so the
-                # first real words aren't synthesised as an unstable "first
-                # utterance" (the hiccup). The warm-up audio is stripped back off
-                # after synthesis. A separate warm-up clip does NOT help — the
-                # model resets per generation, so the prefix must share the call.
-                if s == 0:
-                    if per_cue and warm_word:                 # every cue gets a running start
-                        seg["text"] = f"{warm_word} {part}"
-                        seg["strip_warmup"] = warm_word
-                    elif warm and i == 0:                     # else just cue 1 (old behaviour)
-                        seg["text"] = f"{warm} {part}"
-                        seg["strip_warmup"] = warm
-                segments_by_voice.setdefault(voice_name, []).append(seg)
+        # Contiguous cues (same voice, tiny source gap) are spoken TOGETHER in one
+        # generation — real cross-sentence prosody instead of per-cue "islands"
+        # that each end on a full-stop melody. Each group is ONE clip placed at
+        # the group's start, spanning the combined slot (no re-splitting needed).
+        groups = _dub_groups(cues, req.voice)
+        joined = sum(1 for g in groups if len(g) > 1)
+        if joined:
+            _log(f"flow: joined {joined} contiguous group(s) for smoother prosody", "muted")
 
-        _set(message="Generating voiceover (per cue)…")
+        segments_by_voice = {}
+        for g in groups:
+            first, last = g[0], g[-1]
+            voice_name = cues[first].get("voice") or req.voice
+            text = " ".join((cues[i].get("translated") or "").strip() for i in g).strip()
+            start = float(cues[first].get("start", 0)); end = float(cues[last].get("end", 0))
+            nxt = float(cues[last + 1]["start"]) if last + 1 < len(cues) else end
+            slot = max(0.05, nxt - start)
+            # Say the whole passage as ONE clip so every pause in it is the AI's
+            # own natural pause, not a gap our code inserts. Slot-filling is
+            # handled by breathing (lengthening those real pauses).
+            seg = {"cue": first, "sub": 0, "nsub": 1, "text": text, "members": list(g),
+                   "path": str(work / f"cue_{first:04d}_0.wav"), "slot": slot, "start": start, "next": nxt}
+            # Warm the model up INSIDE the clip's OWN generation, so the first
+            # real words aren't synthesised as an unstable "first utterance" (the
+            # hiccup). The warm-up audio is stripped back off after synthesis. A
+            # separate warm-up clip does NOT help — the model resets per
+            # generation, so the prefix must share the call.
+            if per_cue and warm_word:                 # every generation gets a running start
+                seg["text"] = f"{warm_word} {text}"
+                seg["strip_warmup"] = warm_word
+            elif warm and first == 0:                 # else just cue 1 (old behaviour)
+                seg["text"] = f"{warm} {text}"
+                seg["strip_warmup"] = warm
+            segments_by_voice.setdefault(voice_name, []).append(seg)
+            # Remove stale clips for absorbed members (and legacy split halves) so
+            # a reassembly never double-places words that now live in the group clip.
+            for m in g:
+                for stale in ([f"cue_{m:04d}_1.wav"] + ([f"cue_{m:04d}_0.wav"] if m != first else [])):
+                    p = work / stale
+                    if p.exists():
+                        try: p.unlink()
+                        except OSError: pass
+
+        _set(message="Generating voiceover (grouped cues)…")
         
         all_segments = []
         for voice_name, voice_segments in segments_by_voice.items():
@@ -687,67 +730,62 @@ def _run_dub_cues(job_id: str, req: DubCuesRequest):
                     y = y2
                 y = aligner.strip_leading_hum(y, sr)   # remove a 'hmm/mmm' lead-in
                 y = aligner.trim_onset_wobble(y, sr)   # remove the shaky lead-in
+                # Trim BOTH ends of near-silence in the FILE. Critical for repack:
+                # the packed timeline is computed from file lengths, but the
+                # assembler trims silence at placement — untrimmed tails became
+                # audible gaps between every cue of the original-language dub.
+                y = aligner._trim_silence(y, sr)
                 sf.write(s["path"], y, sr)
             except Exception as exc:
                 _log(f"onset clean failed for cue {s['cue']}: {exc}", "warning")
             _level_clip(s["path"])
 
-        # Build placements. Single-clip cues: at the cue start. Split cues: place
-        # the two halves with the leftover slot time as a real pause between them.
+        # Build placements. One clip per group, placed at the group's start; the
+        # clip internally carries the group's natural cross-sentence prosody.
         placements = []
         real = [s for s in segments if s["cue"] >= 0 and Path(s["path"]).exists()]
-        by_cue = {}
-        for s in real:
-            by_cue.setdefault(s["cue"], []).append(s)
-            
+        by_head = {s["cue"]: s for s in real}
+
+        def _clip_dur(path):
+            try:
+                y, sr = sf.read(path); return (len(y) / sr) if sr else 0.0
+            except Exception:
+                return 0.0
+
         updated_cues = None
         if getattr(req, "repack_timings", False):
-            updated_cues = []
+            # Repack: lay the clips end-to-end at their natural lengths. A group
+            # clip spans its member cues; apportion its duration across them by
+            # text share (timeline display only — the audio is one natural read).
+            updated_cues = [None] * len(cues)
             current_time = 0.0
             for i in range(len(cues)):
-                c = dict(cues[i])
-                c["start"] = round(current_time, 3)
-                if i in by_cue:
-                    group = by_cue[i]
-                    group.sort(key=lambda s: s["sub"])
-                    durs = []
-                    for s in group:
-                        try:
-                            y, sr = sf.read(s["path"]); durs.append((len(y) / sr) if sr else 0.0)
-                        except Exception:
-                            durs.append(0.0)
-                            
-                    if len(group) == 1:
-                        placements.append({"path": group[0]["path"], "start": round(current_time, 3)})
-                        current_time += durs[0]
-                    else:
-                        gap = 0.25  # natural gap between split sentences
-                        for s, d in zip(group, durs):
-                            placements.append({"path": s["path"], "start": round(current_time, 3)})
-                            current_time += d + gap
-                        current_time -= gap
-                c["end"] = round(current_time, 3)
-                updated_cues.append(c)
-                current_time += 0.4  # minimum pause between different cues (paragraphs/speakers)
-        else:
-            for i, group in by_cue.items():
-                group.sort(key=lambda s: s["sub"])
-                start = group[0]["start"]; nxt = group[0]["next"]; slot = max(0.05, nxt - start)
-                durs = []
-                for s in group:
-                    try:
-                        y, sr = sf.read(s["path"]); durs.append((len(y) / sr) if sr else 0.0)
-                    except Exception:
-                        durs.append(0.0)
-                if len(group) == 1:
-                    placements.append({"path": group[0]["path"], "start": start})
+                if updated_cues[i] is not None:
+                    continue                      # already timed as a group member
+                seg = by_head.get(i)
+                if seg:
+                    dur = _clip_dur(seg["path"])
+                    placements.append({"path": seg["path"], "start": round(current_time, 3)})
+                    members = seg.get("members", [i])
+                    weights = [max(1, len((cues[m].get("translated") or "").strip())) for m in members]
+                    tot = float(sum(weights))
+                    t = current_time
+                    for m, w in zip(members, weights):
+                        c = dict(cues[m]); c["start"] = round(t, 3)
+                        t += dur * (w / tot)
+                        c["end"] = round(t, 3)
+                        updated_cues[m] = c
+                    current_time += dur
                 else:
-                    gap = max(0.15, (slot - sum(durs) - 0.08) / max(1, len(group) - 1))
-                    t = start
-                    for s, d in zip(group, durs):
-                        placements.append({"path": s["path"], "start": round(t, 3)})
-                        t += d + gap
-        
+                    c = dict(cues[i])
+                    c["start"] = c["end"] = round(current_time, 3)
+                    updated_cues[i] = c
+                current_time += 0.3  # natural breath between passages (clips are now silence-trimmed)
+            updated_cues = [c for c in updated_cues if c is not None]
+        else:
+            for i, seg in by_head.items():
+                placements.append({"path": seg["path"], "start": seg["start"]})
+
         placements.sort(key=lambda p: p["start"])
 
         if getattr(req, "repack_timings", False) and updated_cues:
@@ -813,6 +851,7 @@ def _clean_cue_clip(path: str, strip_warmup: str, comf: float, _log) -> None:
             y = y2
         y = aligner.strip_leading_hum(y, sr)
         y = aligner.trim_onset_wobble(y, sr)
+        y = aligner._trim_silence(y, sr)   # keep file length ≈ speech (repack packs by file length)
         sf.write(path, y, sr)
     except Exception as exc:
         _log(f"clean failed: {exc}", "warning")
@@ -882,20 +921,28 @@ def _run_redub_cue(job_id: str, req: "RedubCueRequest"):
         work.mkdir(parents=True, exist_ok=True)
         comf = cps.comfortable_cps(req.lang_code)
 
-        text = (req.cues[i].get("translated") or "").strip()
+        # The cue may live inside a contiguous GROUP (spoken as one passage) — the
+        # grouping is deterministic on the cue list, so recompute it and re-voice
+        # the WHOLE group. That keeps the cross-sentence flow intact and keeps the
+        # one-clip-per-group file layout consistent with the full dub.
+        grp = next((g for g in _dub_groups(req.cues, req.voice) if i in g), [i])
+        head = grp[0]
+        text = " ".join((req.cues[m].get("translated") or "").strip() for m in grp).strip()
         if not text:
             _set(status="failed", error="Cue has no text to dub"); return
         warm = config.DUB_WARMUP_WORD if (getattr(config, "DUB_WARMUP_PER_CUE", False)
                                           and getattr(config, "DUB_WARMUP_WORD", "")) else ""
         gen_text = f"{warm} {text}" if warm else text
-        path = work / f"cue_{i:04d}_0.wav"
-        # drop any legacy split half for this cue
-        old1 = work / f"cue_{i:04d}_1.wav"
-        if old1.exists():
-            try: old1.unlink()
-            except OSError: pass
+        path = work / f"cue_{head:04d}_0.wav"
+        # drop stale member clips + legacy split halves (their words are in the group clip)
+        for m in grp:
+            for stale in ([f"cue_{m:04d}_1.wav"] + ([f"cue_{m:04d}_0.wav"] if m != head else [])):
+                p = work / stale
+                if p.exists():
+                    try: p.unlink()
+                    except OSError: pass
 
-        _set(message=f"Re-voicing cue {i + 1}…")
+        _set(message=f"Re-voicing cue {i + 1}" + (f" (group of {len(grp)})" if len(grp) > 1 else "") + "…")
         script = synth.build_synth_script(profile=profile, sentences=[gen_text],
                                           output_paths=[str(path)], skip_indices=set())
         r = subprocess.run([synth.synth_python(profile), "-c", script], capture_output=True, text=True,
@@ -977,23 +1024,42 @@ def refine_cue(req: RefineCueRequest, db: Database = Depends(get_db)):
     target   = cps.target_chars(dur, req.lang_code)
     got_response = False
 
+    # Each retry sees the FULL attempt history with measured CPS, so the model
+    # learns from its misses ("26.4, then 27.1 — go clearly shorter than both")
+    # instead of re-rolling the same length. Too-SHORT lines (dead air before the
+    # next cue) get the inverse treatment: expand toward the slot, no new facts.
+    cps_now  = cps.cps_of(best, dur)
+    sparse   = comf > 0 and dur >= 2.0 and cps_now < 0.55 * comf and not cps.is_rushed(best, dur, req.lang_code)
+    attempts = []
+    kw = dict(provider=provider, api_key=api_key, lm_studio_model=lm_model,
+              context_length=ctx, on_log=lambda *a, **k: None, raise_on_error=True, comf=comf)
     try:
-        for _ in range(3):
-            # raise_on_error=True → a network/provider failure surfaces as a real
-            # error below instead of silently "succeeding" with the unchanged line.
-            cand = (translator.shorten_line(
-                source, best, target, req.lang_code,
-                provider=provider, api_key=api_key,
-                lm_studio_model=lm_model, context_length=ctx,
-                on_log=lambda *a, **k: None,
-                raise_on_error=True,
-            ) or "").strip()
-            got_response = True
-            if cand and fit(cand) < fit(best):
-                best = cand
-            if not cps.is_rushed(best, dur, req.lang_code):
-                break
-            target = int(target * 0.9)
+        if sparse:
+            target = int(dur * comf * 0.85)          # fill ~85% of the slot
+            for _ in range(3):
+                cand = (translator.expand_line(source, best, target, req.lang_code,
+                                               attempts=attempts, **kw) or "").strip()
+                got_response = True
+                if cand:
+                    attempts.append({"text": cand, "cps": cps.cps_of(cand, dur)})
+                    if fit(cand) < fit(best):
+                        best = cand
+                if cps.cps_of(best, dur) >= 0.7 * comf:
+                    break
+        else:
+            for _ in range(3):
+                # raise_on_error=True → a network/provider failure surfaces as a
+                # real error below instead of silently "succeeding" unchanged.
+                cand = (translator.shorten_line(source, best, target, req.lang_code,
+                                                attempts=attempts, **kw) or "").strip()
+                got_response = True
+                if cand:
+                    attempts.append({"text": cand, "cps": cps.cps_of(cand, dur)})
+                    if fit(cand) < fit(best):
+                        best = cand
+                if not cps.is_rushed(best, dur, req.lang_code):
+                    break
+                target = int(target * 0.9)
     except Exception as exc:
         db.log_adhoc_activity("refine_cue", "failed", time.time() - start_time, [], f"Couldn't reach the translation model: {exc}")
         raise HTTPException(503, f"Couldn't reach the translation model: {exc}")
@@ -1084,7 +1150,7 @@ def refine_script(req: RefineScriptRequest, db: Database = Depends(get_db)):
     try:
         resp = translator.call_provider(
             prompt, provider=provider, api_key=api_key,
-            lm_model=lm_model, max_tokens=4096, context_length=ctx,
+            lm_model=lm_model, max_tokens=4096, context_length=ctx, task="refine",
         )
     except Exception as exc:
         db.log_adhoc_activity("refine_script", "failed", time.time() - start_time, [], f"Couldn't reach the AI model: {exc}")
@@ -1148,8 +1214,8 @@ def list_voiceover_projects(db: Database = Depends(get_db)):
     out = []
     for row in db.list_projects():
         pid = row["id"]
-        if db.get_setting(f"project_kind_{pid}", "") == "video_refine":
-            continue                          # Video Refine projects live in their own section
+        if db.get_setting(f"project_kind_{pid}", "") in ("video_refine", "recap"):
+            continue                          # those live in their own sections, never in Voiceover
         sess = {}
         p = _session_path(pid)
         if p.exists():

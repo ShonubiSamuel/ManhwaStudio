@@ -72,12 +72,12 @@ def _dub_session_path(pid: int) -> Path:
 
 
 @router.get("/projects")
-def list_refine_projects(db: Database = Depends(get_db)):
-    """Only projects created in Video Refine (kept separate from Voiceover)."""
+def list_refine_projects(kind: str = "video_refine", db: Database = Depends(get_db)):
+    """Projects of one kind: 'video_refine' (video-sourced) or 'recap' (PDF-sourced)."""
     out = []
     for row in db.list_projects():
         pid = row["id"]
-        if db.get_setting(_kind_key(pid), "") != "video_refine":
+        if db.get_setting(_kind_key(pid), "") != kind:
             continue
         sess = {}
         p = _dub_session_path(pid)
@@ -97,23 +97,195 @@ def list_refine_projects(db: Database = Depends(get_db)):
 class RefineProjectCreate(BaseModel):
     name:        str
     source_path: str = ""
+    kind:        str = "video_refine"    # or "recap" (PDF-sourced, no video)
 
 
 @router.post("/projects")
 def create_refine_project(body: RefineProjectCreate, db: Database = Depends(get_db)):
     name = (body.name or "").strip() or "Untitled refine"
+    kind = body.kind if body.kind in ("video_refine", "recap") else "video_refine"
     pid = db.add_project(name)
-    # Tag it as a Video Refine project so it never shows in Voiceover.
-    db.set_setting(_kind_key(pid), "video_refine")
-    # Seed the DUB session (Video Refine uses the Voiceover editor) so its setup
-    # screen pre-fills the source the user just picked.
+    # Tag the kind so each section lists only its own projects.
+    db.set_setting(_kind_key(pid), kind)
+    # Seed the DUB session (both sections use the Voiceover editor).
     # No default language: the user adds languages themselves (the + button).
+    # Recap: the "source" IS the PDF — seed pdfPath so the editor opens on it.
     _dub_session_path(pid).write_text(json.dumps({
         "cues": [], "sourcePath": body.source_path, "targetLang": "",
-        "languages": [], "selectedLang": "",
-        "pdfPath": "", "updatedAt": __import__("time").time() * 1000,
+        "languages": [], "selectedLang": "", "kind": kind,
+        "pdfPath": body.source_path if kind == "recap" else "",
+        "updatedAt": __import__("time").time() * 1000,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"id": pid, "title": name, "cue_count": 0, "source_path": body.source_path}
+
+
+# ── Recap state (character registry + rolling story memory), per project ──────
+
+def _recap_state_path(pid: int) -> Path:
+    return _project_dir(pid) / "recap_state.json"
+
+
+def _load_recap_state(pid: int) -> dict:
+    from ai import recap_narrator
+    p = _recap_state_path(pid)
+    if p.exists():
+        try:
+            st = json.loads(p.read_text(encoding="utf-8"))
+            st.setdefault("registry", {"characters": []})
+            st.setdefault("memory", "")
+            st.setdefault("cast_seed", "")
+            return st
+        except Exception:
+            pass
+    return recap_narrator.blank_state()
+
+
+def _save_recap_state(pid: int, state: dict) -> None:
+    _recap_state_path(pid).write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+@router.get("/recap-state/{project_id}")
+def get_recap_state(project_id: int, db: Database = Depends(get_db)):
+    """The living character registry + rolling story memory + cast seed."""
+    return _load_recap_state(project_id)
+
+
+@router.put("/recap-state/{project_id}")
+def put_recap_state(project_id: int, body: dict, db: Database = Depends(get_db)):
+    """Persist user edits to the registry / cast seed / memory (human safety net)."""
+    if not db.get_project(project_id):
+        raise HTTPException(404, f"Project {project_id} not found")
+    state = _load_recap_state(project_id)
+    if isinstance(body.get("registry"), dict):     state["registry"] = body["registry"]
+    if "memory" in body:                            state["memory"] = str(body.get("memory") or "")
+    if "cast_seed" in body:                         state["cast_seed"] = str(body.get("cast_seed") or "")
+    _save_recap_state(project_id, state)
+    return {"ok": True}
+
+
+def _model_for_provider(db: Database, provider: str, kind: str) -> str:
+    """The model id a provider uses for a task. kind: 'translate'|'refine'|'narrate'
+    (narrate = the vision model)."""
+    if provider == "nvidia":
+        if kind == "narrate":
+            return db.get_setting("nvidia_vision_model", "") or config.NVIDIA_VISION_MODEL
+        return db.get_setting(f"nvidia_{kind}_model", "") or config.NVIDIA_MODEL
+    if provider == "github":
+        return db.get_setting("github_model", "") or "openai/gpt-4o-mini"
+    if provider == "groq":
+        return db.get_setting("groq_model", "") or ""
+    if provider == "lm_studio":
+        return db.get_setting("lm_studio_model", "")
+    return ""
+
+
+@router.get("/narrate-plan")
+def narrate_plan(db: Database = Depends(get_db)):
+    """How the Recap narration will batch given the current model settings — the
+    UI uses effective_batch to slice crops so it auto-adapts to each model
+    (a 1-image model drops to 1; a capable model honours your preference)."""
+    from ai import model_caps
+    vprovider = db.get_setting("ai_provider_narrate", "github")
+    tprovider = db.get_setting("ai_provider_refine", "nvidia")
+    vmodel = _model_for_provider(db, vprovider, "narrate")
+    rmodel = _model_for_provider(db, tprovider, "refine")
+    try:    pref = int(db.get_setting("recap_batch_size", "2"))
+    except (TypeError, ValueError): pref = 2
+    vcap = model_caps.caps_for(vmodel, vision=True)
+    rcap = model_caps.caps_for(rmodel, vision=False)
+    return {
+        "effective_batch":   model_caps.effective_batch(pref, vmodel),
+        "preferred_batch":   pref,
+        "vision_provider":   vprovider, "vision_model": vmodel,
+        "vision_max_images": vcap["max_images"],
+        "reasoner_provider": tprovider, "reasoner_model": rmodel,
+        "reasoner_max_output": rcap["max_output"],
+    }
+
+
+class NarrateRequest(BaseModel):
+    project_id:   int
+    prompt:       str = ""          # narration style instructions
+    images:       List[dict] = []   # [{index:int, data:str(b64 or data-url)}]
+    reset_memory: bool = False      # start a fresh chapter (keeps the registry)
+
+
+@router.post("/narrate")
+def narrate_panels(req: NarrateRequest, db: Database = Depends(get_db)):
+    """ONE batch of cropped panels → narration lines, via the stateful two-call
+    storytelling pipeline (see ai/recap_narrator.py):
+
+        Call 1  VISION           → honest per-panel facts (no name guessing).
+        Call 2  RESOLVE+NARRATE  → identity-aware narration + registry/memory update.
+
+    The registry + rolling memory persist in recap_state.json and carry forward
+    across batches (and chapters), so the narration knows names, relationships,
+    and appearance changes instead of reading each panel in isolation."""
+    import time
+    from ai import recap_narrator
+    t0 = time.time()
+    log_lines = []
+
+    def _log(msg, level="info"):
+        log_lines.append({"timestamp": time.time(), "level": level, "message": msg})
+
+    def _finish(status, error=""):
+        db.log_adhoc_activity("recap_narrate", status, time.time() - t0, log_lines, error, "Recap")
+
+    if not req.images:
+        _log("No images in batch", "error"); _finish("failed", "No images in batch")
+        raise HTTPException(400, "No images in batch")
+
+    vprovider = db.get_setting("ai_provider_narrate", "github")   # VISION (call 1)
+    tprovider = db.get_setting("ai_provider_refine", "nvidia")    # TEXT reasoning (call 2)
+    nvidia_key = db.get_setting("nvidia_api_key", "")
+    vmodel = _model_for_provider(db, vprovider, "narrate")
+    rmodel = _model_for_provider(db, tprovider, "refine")
+    lm_model = db.get_setting("lm_studio_model", "")
+    try:    ctx = int(db.get_setting("lm_studio_context_length", "32768"))
+    except (TypeError, ValueError): ctx = 32768
+
+    b64s = [(img.get("data") or "").split(",", 1)[-1] for img in req.images]
+    idxs = [int(img.get("index", i)) for i, img in enumerate(req.images)]
+    style = (req.prompt or "").strip() or (
+        "Engaging, dramatic third-person recap narration, present tense, punchy and flowing.")
+
+    # Defensive: never send more images than the vision model accepts.
+    from ai import model_caps
+    vmax = model_caps.caps_for(vmodel, vision=True)["max_images"] or 1
+    if len(b64s) > vmax:
+        _log(f"batch of {len(b64s)} exceeds {vmodel}'s {vmax}-image limit", "error")
+        _finish("failed", f"{vmodel} accepts at most {vmax} image(s) per call — lower the batch size.")
+        raise HTTPException(400, f"{vmodel} accepts at most {vmax} image(s) per call.")
+    # The storyteller's reply can be large (narration + registry + memory); size
+    # max_tokens to what the reasoner model actually allows so it never truncates.
+    rmax = model_caps.output_cap(rmodel, vision=False, want=16000)
+
+    state = _load_recap_state(req.project_id)
+    if req.reset_memory:
+        state["memory"] = ""
+        _log("story memory reset for a new chapter (registry kept)", "muted")
+
+    _log(f"▶ Batch of {len(b64s)} panel(s) — vision {vmodel} ({vprovider}), story {rmodel} ({tprovider}, out≤{rmax})", "accent")
+    try:
+        facts = recap_narrator.extract_facts(
+            b64s, vprovider, nvidia_key=nvidia_key, nvidia_vision_model=vmodel, log=_log)
+        _log(f"vision: extracted facts for {len(facts)} panel(s)", "muted")
+        result = recap_narrator.narrate_batch(
+            facts, idxs, style, state,
+            provider=tprovider, nvidia_key=nvidia_key, lm_model=lm_model,
+            context_length=ctx, log=_log, max_tokens=rmax)
+    except Exception as exc:
+        _log(f"Narration failed: {exc}", "error"); _finish("failed", str(exc))
+        raise HTTPException(502, f"Narration failed: {exc}")
+
+    _save_recap_state(req.project_id, state)
+    n = sum(1 for l in result["lines"] if l["text"])
+    _log(f"✓ Narrated {n}/{len(idxs)} panel(s)", "success")
+    _finish("done")
+    return {"lines": result["lines"],
+            "registry": state.get("registry", {"characters": []}),
+            "memory": state.get("memory", "")}
 
 
 @router.get("/session/{project_id}")

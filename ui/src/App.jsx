@@ -11,6 +11,7 @@ import { colors } from "./theme"
 import Sidebar    from "./components/Sidebar"
 import Voiceover  from "./pages/Voiceover"
 import VideoRefine from "./pages/VideoRefine"
+import Recap from "./pages/Recap"
 import Voices     from "./pages/Voices"
 import ComingSoon from "./pages/ComingSoon"
 import Settings   from "./pages/Settings"
@@ -28,6 +29,9 @@ function PageRouter() {
       </div>
       <div style={{ display: p === PAGES.VIDEO_REFINE ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
         <VideoRefine />
+      </div>
+      <div style={{ display: p === PAGES.RECAP ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
+        <Recap />
       </div>
       <div style={{ display: p === PAGES.TRANSCRIPTION ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
         <ComingSoon title="Transcription" icon="≣" desc="Upload audio or video and get an accurate, speaker-aware transcript you can edit and export (SRT / TXT)." />
