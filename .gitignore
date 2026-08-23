@@ -199,3 +199,18 @@ voices/refs/
 
 # ---- OS ----
 .DS_Store
+
+# ---- Generated audio / video output (and source media) ----
+Export/
+input/
+output/
+*.mp3
+*.m4a
+*.wav
+*.mp4
+!ui/src/assets/**
+
+# ---- Local database + binary tool bundles ----
+studio.db
+*.db
+*.mcpb
