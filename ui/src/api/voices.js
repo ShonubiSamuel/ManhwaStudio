@@ -27,6 +27,11 @@ export function deleteVoice(name) {
   return del(`/voices/${encodeURIComponent(name)}`)
 }
 
+/** Absolute URL to a voice's stored reference clip (for a preview <audio>). */
+export function voiceReferenceUrl(name) {
+  return `http://127.0.0.1:8000/api/voices/${encodeURIComponent(name)}/reference-audio`
+}
+
 /** Attach a reference clip (local file path) to a voice + auto-transcribe. */
 export function setVoiceReference(name, sourcePath, transcribe = true) {
   return post(`/voices/${encodeURIComponent(name)}/reference`, { source_path: sourcePath, transcribe })
@@ -49,6 +54,11 @@ export function quickTTS(text, voice, language, projectId = null, langCode = nul
   return post("/tts/quick", { text, voice, language: language || null, project_id: projectId, lang_code: langCode })
 }
 
+/** Render a standalone passage. Each request receives its own WAV output. */
+export function renderTTS(text, voice, language = null) {
+  return post("/tts/render", { text, voice, language: language || null })
+}
+
 /** Poll any TTS job (quick / design / ad-hoc). */
 export function quickTTSStatus(jobId) {
   return get(`/tts/quick/${jobId}`)
@@ -57,9 +67,4 @@ export function quickTTSStatus(jobId) {
 /** Design a reference clip from a text persona (Qwen3 VoiceDesign). @returns job */
 export function designVoice(instruct, text, language) {
   return post("/voices/design", { instruct, text, language: language || "English" })
-}
-
-/** Dub a free-form multi-line script with one voice (active engine). @returns job */
-export function dubAdhoc(text, voice, language) {
-  return post("/tts/dub-adhoc", { text, voice, language: language || null })
 }

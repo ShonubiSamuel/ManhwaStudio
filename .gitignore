@@ -187,3 +187,15 @@ studio.db-shm
 studio.db-wal
 .DS_Store
 scripts/studio.db
+
+# ---- Large re-downloadable model weights (fetch via scripts, do not commit) ----
+models/
+voices/refs/
+*.safetensors
+*.onnx
+*.ckpt
+*.pt
+*.bin
+
+# ---- OS ----
+.DS_Store

@@ -185,12 +185,78 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+-- Structured recap memory. Generated prose is never treated as the source of
+-- truth: characters, appearances and events retain their panel evidence.
+CREATE TABLE IF NOT EXISTS story_characters (
+    stable_id        TEXT PRIMARY KEY,
+    project_id       INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    canonical_name   TEXT    DEFAULT '',
+    role_label       TEXT    DEFAULT '',
+    aliases_json     TEXT    DEFAULT '[]',
+    appearance       TEXT    DEFAULT '',
+    status           TEXT    DEFAULT '',
+    confidence       REAL    DEFAULT 0,
+    first_seen_panel INTEGER DEFAULT NULL,
+    last_seen_panel  INTEGER DEFAULT NULL,
+    created_at       REAL    NOT NULL,
+    updated_at       REAL    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS story_appearances (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id      INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    stable_id       TEXT    NOT NULL,
+    panel_index     INTEGER NOT NULL,
+    source_tag      TEXT    DEFAULT '',
+    description     TEXT    DEFAULT '',
+    confidence      REAL    DEFAULT 0,
+    evidence_json   TEXT    DEFAULT '{}',
+    created_at      REAL    NOT NULL,
+    UNIQUE(project_id, stable_id, panel_index, source_tag)
+);
+
+CREATE TABLE IF NOT EXISTS story_events (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id        INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    panel_from        INTEGER DEFAULT NULL,
+    panel_to          INTEGER DEFAULT NULL,
+    summary           TEXT    NOT NULL,
+    participants_json TEXT    DEFAULT '[]',
+    evidence_json     TEXT    DEFAULT '{}',
+    created_at        REAL    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS story_relationships (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    source_id     TEXT    NOT NULL,
+    target_id     TEXT    NOT NULL,
+    relation      TEXT    NOT NULL,
+    confidence    REAL    DEFAULT 0,
+    evidence_json TEXT    DEFAULT '{}',
+    updated_at    REAL    NOT NULL,
+    UNIQUE(project_id, source_id, target_id, relation)
+);
+
+CREATE TABLE IF NOT EXISTS story_memory_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    action      TEXT    NOT NULL,
+    before_json TEXT    NOT NULL,
+    after_json  TEXT    NOT NULL,
+    created_at  REAL    NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_episodes_project   ON episodes(project_id);
 CREATE INDEX IF NOT EXISTS idx_panels_episode     ON panels(episode_id);
 CREATE INDEX IF NOT EXISTS idx_dub_lang_episode   ON dub_languages(episode_id);
 CREATE INDEX IF NOT EXISTS idx_panel_audio_panel  ON panel_audio(panel_id);
 CREATE INDEX IF NOT EXISTS idx_narr_batch_episode ON narration_batches(episode_id);
 CREATE INDEX IF NOT EXISTS idx_logs_episode       ON processing_logs(episode_id);
+CREATE INDEX IF NOT EXISTS idx_story_chars_project ON story_characters(project_id, last_seen_panel);
+CREATE INDEX IF NOT EXISTS idx_story_appear_project ON story_appearances(project_id, panel_index);
+CREATE INDEX IF NOT EXISTS idx_story_events_project ON story_events(project_id, panel_to);
+CREATE INDEX IF NOT EXISTS idx_story_memory_history_project ON story_memory_history(project_id, id);
 """
 
 
@@ -385,16 +451,29 @@ class Database:
     # ══════════════════════════════════════════════════════════════════════════
 
     def add_project(self, name: str) -> int:
-        folder_name = name.lower().replace(" ", "_")
+        """Create a NEW project and return its id.
+
+        Project names are UNIQUE. If the requested name is already taken we
+        auto-suffix ' (2)', ' (3)', … until it's free, so this ALWAYS creates a
+        distinct project. It must never silently return an existing project —
+        doing so would make two logically-separate recaps share the same output
+        folder and character state (registry/memory), leaking one story into
+        another."""
+        base = (name or "").strip() or "Untitled"
         now = self._now()
-        try:
-            cur = self._execute(
-                "INSERT INTO projects (name, folder_name, created_at, updated_at) VALUES (?, ?, ?, ?)",
-                (name, folder_name, now, now),
-            )
-            return cur.lastrowid
-        except sqlite3.IntegrityError:
-            return self._fetchone("SELECT id FROM projects WHERE name=?", (name,))["id"]
+        candidate, n = base, 1
+        while True:
+            try:
+                cur = self._execute(
+                    "INSERT INTO projects (name, folder_name, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    (candidate, candidate.lower().replace(" ", "_"), now, now),
+                )
+                return cur.lastrowid
+            except sqlite3.IntegrityError:
+                n += 1
+                if n > 9999:
+                    raise
+                candidate = f"{base} ({n})"
 
     def get_project(self, project_id: int) -> Optional[dict]:
         return self._row(self._fetchone("SELECT * FROM projects WHERE id=?", (project_id,)))
@@ -421,6 +500,186 @@ class Database:
             "SELECT COUNT(*) as n FROM episodes WHERE project_id=? AND stage_assemble='done'",
             (project_id,))["n"]
         return {"total_episodes": total, "done_episodes": done}
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STORY MEMORY (Recap)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def list_story_characters(self, project_id: int) -> list[dict]:
+        rows = self._rows(self._fetchall(
+            "SELECT * FROM story_characters WHERE project_id=? "
+            "ORDER BY last_seen_panel DESC, canonical_name COLLATE NOCASE", (project_id,)))
+        for row in rows:
+            try: row["aliases"] = json.loads(row.pop("aliases_json", "[]"))
+            except Exception: row["aliases"] = []
+        return rows
+
+    def get_story_character(self, stable_id: str) -> Optional[dict]:
+        row = self._row(self._fetchone("SELECT * FROM story_characters WHERE stable_id=?", (stable_id,)))
+        if row:
+            try: row["aliases"] = json.loads(row.pop("aliases_json", "[]"))
+            except Exception: row["aliases"] = []
+        return row
+
+    def upsert_story_character(self, project_id: int, stable_id: str, *,
+                               canonical_name: str = "", role_label: str = "",
+                               aliases: list | None = None, appearance: str = "",
+                               status: str = "", confidence: float = 0,
+                               panel_index: int | None = None) -> dict:
+        existing = self.get_story_character(stable_id)
+        now = self._now()
+        aliases = [str(a).strip() for a in (aliases or []) if str(a).strip()]
+        if existing:
+            merged = list(existing.get("aliases") or [])
+            for alias in aliases:
+                if alias not in merged:
+                    merged.append(alias)
+            values = {
+                "canonical_name": canonical_name or existing.get("canonical_name", ""),
+                "role_label": role_label or existing.get("role_label", ""),
+                "aliases_json": json.dumps(merged, ensure_ascii=False),
+                "appearance": appearance or existing.get("appearance", ""),
+                "status": status or existing.get("status", ""),
+                "confidence": max(float(existing.get("confidence") or 0), float(confidence or 0)),
+                "last_seen_panel": panel_index if panel_index is not None else existing.get("last_seen_panel"),
+                "updated_at": now,
+            }
+            sets = ", ".join(f"{key}=?" for key in values)
+            self._execute(f"UPDATE story_characters SET {sets} WHERE stable_id=?", tuple(values.values()) + (stable_id,))
+        else:
+            self._execute(
+                "INSERT INTO story_characters (stable_id, project_id, canonical_name, role_label, aliases_json, "
+                "appearance, status, confidence, first_seen_panel, last_seen_panel, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (stable_id, project_id, canonical_name, role_label, json.dumps(aliases, ensure_ascii=False),
+                 appearance, status, float(confidence or 0), panel_index, panel_index, now, now),
+            )
+        return self.get_story_character(stable_id) or {}
+
+    def update_story_character(self, project_id: int, stable_id: str, **changes) -> Optional[dict]:
+        allowed = {"canonical_name", "role_label", "appearance", "status", "confidence", "aliases"}
+        data = {key: value for key, value in changes.items() if key in allowed}
+        if "aliases" in data:
+            data["aliases_json"] = json.dumps(data.pop("aliases") or [], ensure_ascii=False)
+        if not data:
+            return self.get_story_character(stable_id)
+        data["updated_at"] = self._now()
+        sets = ", ".join(f"{key}=?" for key in data)
+        self._execute(f"UPDATE story_characters SET {sets} WHERE project_id=? AND stable_id=?",
+                      tuple(data.values()) + (project_id, stable_id))
+        return self.get_story_character(stable_id)
+
+    def add_story_appearance(self, project_id: int, stable_id: str, panel_index: int, *,
+                             source_tag: str = "", description: str = "", confidence: float = 0,
+                             evidence: dict | None = None) -> None:
+        self._execute(
+            "INSERT INTO story_appearances (project_id, stable_id, panel_index, source_tag, description, confidence, evidence_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(project_id, stable_id, panel_index, source_tag) "
+            "DO UPDATE SET description=excluded.description, confidence=MAX(story_appearances.confidence, excluded.confidence), evidence_json=excluded.evidence_json",
+            (project_id, stable_id, panel_index, source_tag, description, float(confidence or 0),
+             json.dumps(evidence or {}, ensure_ascii=False), self._now()),
+        )
+
+    def add_story_event(self, project_id: int, summary: str, *, panel_from: int | None = None,
+                        panel_to: int | None = None, participants: list | None = None,
+                        evidence: dict | None = None) -> None:
+        summary = (summary or "").strip()
+        if not summary:
+            return
+        # One current narration event per panel range. Re-running a chapter
+        # updates its evidence rather than bloating retrieval with duplicates.
+        if panel_from is not None and panel_to is not None:
+            self._execute("DELETE FROM story_events WHERE project_id=? AND panel_from=? AND panel_to=?",
+                          (project_id, panel_from, panel_to))
+        self._execute(
+            "INSERT INTO story_events (project_id, panel_from, panel_to, summary, participants_json, evidence_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (project_id, panel_from, panel_to, summary, json.dumps(participants or [], ensure_ascii=False),
+             json.dumps(evidence or {}, ensure_ascii=False), self._now()),
+        )
+
+    def list_story_events(self, project_id: int, limit: int = 50) -> list[dict]:
+        rows = self._rows(self._fetchall(
+            "SELECT * FROM story_events WHERE project_id=? ORDER BY id DESC LIMIT ?", (project_id, limit)))
+        for row in rows:
+            try: row["participants"] = json.loads(row.pop("participants_json", "[]"))
+            except Exception: row["participants"] = []
+            try: row["evidence"] = json.loads(row.pop("evidence_json", "{}"))
+            except Exception: row["evidence"] = {}
+        return rows
+
+    def story_memory_snapshot_raw(self, project_id: int) -> dict:
+        """Lossless project snapshot used for reversible human memory edits."""
+        return {
+            "characters": self._rows(self._fetchall("SELECT * FROM story_characters WHERE project_id=?", (project_id,))),
+            "appearances": self._rows(self._fetchall("SELECT * FROM story_appearances WHERE project_id=?", (project_id,))),
+            "events": self._rows(self._fetchall("SELECT * FROM story_events WHERE project_id=?", (project_id,))),
+            "relationships": self._rows(self._fetchall("SELECT * FROM story_relationships WHERE project_id=?", (project_id,))),
+        }
+
+    def restore_story_memory_snapshot(self, project_id: int, snapshot: dict) -> None:
+        """Restore one project only; used exclusively by Story Memory undo/redo."""
+        for table in ("story_relationships", "story_appearances", "story_events", "story_characters"):
+            self._execute(f"DELETE FROM {table} WHERE project_id=?", (project_id,))
+        specs = {
+            "characters": ("story_characters", ("stable_id", "project_id", "canonical_name", "role_label", "aliases_json", "appearance", "status", "confidence", "first_seen_panel", "last_seen_panel", "created_at", "updated_at")),
+            "appearances": ("story_appearances", ("id", "project_id", "stable_id", "panel_index", "source_tag", "description", "confidence", "evidence_json", "created_at")),
+            "events": ("story_events", ("id", "project_id", "panel_from", "panel_to", "summary", "participants_json", "evidence_json", "created_at")),
+            "relationships": ("story_relationships", ("id", "project_id", "source_id", "target_id", "relation", "confidence", "evidence_json", "updated_at")),
+        }
+        for key, (table, columns) in specs.items():
+            rows = snapshot.get(key) or []
+            if not rows:
+                continue
+            marks = ", ".join("?" for _ in columns)
+            self._conn.executemany(
+                f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({marks})",
+                [tuple(row.get(column) for column in columns) for row in rows],
+            )
+
+    def record_story_memory_history(self, project_id: int, action: str, before: dict, after: dict) -> None:
+        key = f"story_memory_history_cursor_{project_id}"
+        cursor = int(self.get_setting(key, "0") or 0)
+        self._execute("DELETE FROM story_memory_history WHERE project_id=? AND id>?", (project_id, cursor))
+        row = self._execute(
+            "INSERT INTO story_memory_history (project_id, action, before_json, after_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (project_id, action, json.dumps(before, ensure_ascii=False), json.dumps(after, ensure_ascii=False), self._now()),
+        )
+        self.set_setting(key, str(row.lastrowid))
+
+    def story_memory_undo(self, project_id: int) -> bool:
+        key = f"story_memory_history_cursor_{project_id}"
+        cursor = int(self.get_setting(key, "0") or 0)
+        row = self._row(self._fetchone("SELECT * FROM story_memory_history WHERE project_id=? AND id<=? ORDER BY id DESC LIMIT 1", (project_id, cursor)))
+        if not row:
+            return False
+        self.restore_story_memory_snapshot(project_id, json.loads(row["before_json"]))
+        self.set_setting(key, str(int(row["id"]) - 1))
+        return True
+
+    def story_memory_redo(self, project_id: int) -> bool:
+        key = f"story_memory_history_cursor_{project_id}"
+        cursor = int(self.get_setting(key, "0") or 0)
+        row = self._row(self._fetchone("SELECT * FROM story_memory_history WHERE project_id=? AND id>? ORDER BY id ASC LIMIT 1", (project_id, cursor)))
+        if not row:
+            return False
+        self.restore_story_memory_snapshot(project_id, json.loads(row["after_json"]))
+        self.set_setting(key, str(row["id"]))
+        return True
+
+    def story_memory_history_state(self, project_id: int) -> dict:
+        cursor = int(self.get_setting(f"story_memory_history_cursor_{project_id}", "0") or 0)
+        can_undo = self._fetchone("SELECT 1 FROM story_memory_history WHERE project_id=? AND id<=? LIMIT 1", (project_id, cursor)) is not None
+        can_redo = self._fetchone("SELECT 1 FROM story_memory_history WHERE project_id=? AND id>? LIMIT 1", (project_id, cursor)) is not None
+        return {"can_undo": can_undo, "can_redo": can_redo}
+
+    def delete_story_character(self, project_id: int, stable_id: str) -> None:
+        self._execute("DELETE FROM story_appearances WHERE project_id=? AND stable_id=?", (project_id, stable_id))
+        self._execute("DELETE FROM story_relationships WHERE project_id=? AND (source_id=? OR target_id=?)", (project_id, stable_id, stable_id))
+        for event in self._rows(self._fetchall("SELECT id, participants_json FROM story_events WHERE project_id=?", (project_id,))):
+            participants = [value for value in json.loads(event.get("participants_json") or "[]") if value != stable_id]
+            self._execute("UPDATE story_events SET participants_json=? WHERE id=?", (json.dumps(participants, ensure_ascii=False), event["id"]))
+        self._execute("DELETE FROM story_characters WHERE project_id=? AND stable_id=?", (project_id, stable_id))
 
     # ══════════════════════════════════════════════════════════════════════════
     # EPISODES

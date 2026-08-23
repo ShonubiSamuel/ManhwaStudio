@@ -46,14 +46,22 @@ function PageCanvas({ doc, pageNum, scrollRef }) {
   return <canvas ref={ref} style={{ width: "100%", height: "100%", display: "block" }} />
 }
 
+// Session-remembered zoom, shared across every PdfReader mount (the panel editor
+// remounts a fresh reader each time you open a thumbnail).
+let _lastZoom = 1
+
 // multi mode (Recap): every finished crop STAYS on the page as a numbered box,
 // stacking one under another so the whole chapter's cropping is reviewable
 // before sending; onNarrate(dataUrls) fires with every crop composited in order.
-function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach, multi = false, onNarrate = null, narrating = false, boxesValue = null, onBoxesChange = null }) {
+function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach, multi = false, onNarrate = null, narrating = false, boxesValue = null, onBoxesChange = null,
+                     initialBox = null, attachLabel = null, onBeforeChange = null }) {
   const [doc, setDoc] = useState(null)
   const [dims, setDims] = useState([])     // intrinsic {w,h} per page (scale 1)
   const [loading, setLoading] = useState(false)
-  const [zoom, setZoom] = useState(1)
+  // Zoom persists across every open of the cropper (module-level, remembered for
+  // the session) so the user isn't reset to 100% each time they edit a panel.
+  const [zoom, setZoomState] = useState(() => _lastZoom)
+  const setZoom = (u) => setZoomState((z) => { const nz = typeof u === "function" ? u(z) : u; _lastZoom = nz; return nz })
   const [box, setBox] = useState(null)     // { x,w : fraction of width ; y,h : intrinsic px in column }
   // Committed crops. CONTROLLED when the parent passes boxesValue/onBoxesChange
   // (Recap persists them in the session so they survive leaving/closing the app).
@@ -67,6 +75,7 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach, multi = fals
   const [panning, setPanning] = useState(false)
   const [err, setErr] = useState("")
   const scrollRef = useRef(null)
+  const scrollToBoxRef = useRef(null)   // the initialBox we've already jumped to (once-guard)
 
   // Load the PDF client-side (PDF.js) — instant first page, lazy rest.
   useEffect(() => {
@@ -96,6 +105,14 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach, multi = fals
     return () => { cancelled = true; task.destroy?.() }
   }, [pdfUrl])
 
+  // Seed the active box from the cue's stored crop (per-cue panel editing) once
+  // the document is ready. Re-seeds only when the seed itself changes.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- seeding from a prop once the doc is ready
+    if (initialBox && doc) setBox({ ...initialBox })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialBox, doc])
+
   // Per-page geometry. All pages are shown at the SAME display width but each at
   // its OWN aspect ratio (height = width × h/w), so narrower pages aren't squashed.
   // Heights are measured in "units of one column width"; offsets accumulate them.
@@ -107,6 +124,21 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach, multi = fals
     return { uh, uoff, total: t || 1 }
   }, [dims])
   const colH = displayW * geo.total          // total display column height
+
+  // Jump to the seeded panel once the column has real height — so editing a
+  // cue's crop opens AT that panel instead of the top of a long PDF. Fires once
+  // per initialBox (guarded), so zooming/scrolling afterward isn't fought.
+  useLayoutEffect(() => {
+    const b = initialBox
+    const el = scrollRef.current
+    if (!b || !el || colH < 2 || dims.length === 0) return
+    if (scrollToBoxRef.current === b) return
+    scrollToBoxRef.current = b
+    const boxMid = (b.y + b.h / 2) * colH
+    el.scrollTop = Math.max(0, boxMid - el.clientHeight / 2)
+    el.scrollLeft = Math.max(0, (b.x + b.w / 2) * displayW - el.clientWidth / 2)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialBox, colH, dims.length])
 
   // Box is stored as fractions: x,w of width ; y,h of the whole column.
   const normInColumn = (e, colEl) => {
@@ -124,6 +156,9 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach, multi = fals
     const sm = normInColumn(e, colEl)
     const editing = idx >= 0
     const sb = editing ? { ...boxes[idx] } : (box ? { ...box } : null)
+    // History: one undo entry per GESTURE on a committed box (move/resize start),
+    // never per mousemove. Draw gestures record at commit time in up().
+    if (editing && onBeforeChange) onBeforeChange("adjust crop")
     if (mode === "draw") setBox(null)
 
     // cur tracks the latest geometry in a plain closure var, so the commit reads
@@ -158,7 +193,10 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach, multi = fals
       window.removeEventListener("mousemove", mv); window.removeEventListener("mouseup", up)
       // Multi mode: a finished DRAW commits the crop into `boxes` (once).
       if (multi && mode === "draw") {
-        if (cur && cur.w > 0.005 && cur.h > 0.002) setBoxes((list) => [...list, cur])
+        if (cur && cur.w > 0.005 && cur.h > 0.002) {
+          if (onBeforeChange) onBeforeChange("create crop")
+          setBoxes((list) => [...list, cur])
+        }
         setBox(null)
       }
     }
@@ -202,9 +240,11 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach, multi = fals
 
   const attach = async () => {
     const data = await cropToDataUrl()
-    if (!data) return
-    const ok = await onAttach(data)
-    if (ok) setBox(null)
+    if (!data || !box) return
+    // Hand the crop geometry along with the pixels so the cue can OWN its box
+    // (per-cue panel editing re-seeds the editor from it later).
+    const ok = await onAttach(data, { ...box })
+    if (ok && !initialBox) setBox(null)
   }
 
   // Multi mode: composite every committed crop (top-to-bottom order) and hand
@@ -339,7 +379,7 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach, multi = fals
         {multi ? (
           <>
             <span style={{ color: colors.textDim, fontSize: fonts.sm }}>{boxes.length} crop{boxes.length === 1 ? "" : "s"}</span>
-            {boxes.length > 0 && <IconBtn onClick={() => setBoxes([])} title="Clear all crops">🗑</IconBtn>}
+            {boxes.length > 0 && <IconBtn onClick={() => { if (onBeforeChange) onBeforeChange("clear all crops"); setBoxes([]) }} title="Clear all crops">🗑</IconBtn>}
             <Button variant="primary" disabled={narrating || !boxes.length} loading={narrating}
               onClick={narrateAll} style={{ borderRadius: radius.md }}>
               {narrating ? "Narrating…" : `🪄 Narrate ${boxes.length || ""} crop${boxes.length === 1 ? "" : "s"}`}
@@ -347,7 +387,7 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach, multi = fals
           </>
         ) : (
           <Button variant="primary" disabled={cropping || !box} loading={cropping} onClick={attach} style={{ borderRadius: radius.md }}>
-            {cropping ? "Saving…" : `Attach to cue ${activeCue}  (A)`}
+            {cropping ? "Saving…" : (attachLabel || `Attach to cue ${activeCue}  (A)`)}
           </Button>
         )}
       </div>
@@ -397,7 +437,7 @@ function PdfReader({ pdfUrl, cropping, activeCue, onOpen, onAttach, multi = fals
                   style={{ position: "absolute", left: b.x * displayW, top: b.y * colH, width: b.w * displayW, height: b.h * colH,
                     border: "2px solid #4ea1ff", background: "rgba(78,161,255,0.10)", zIndex: 1, cursor: space ? "inherit" : "move" }}>
                   <span style={{ position: "absolute", top: -1, left: -1, background: "#4ea1ff", color: "#000", fontSize: 11, fontWeight: 700, padding: "1px 7px", borderRadius: "0 0 6px 0" }}>{rank}</span>
-                  <button onMouseDown={(e) => { e.stopPropagation(); e.preventDefault(); setBoxes((list) => list.filter((_, k) => k !== realIdx)) }}
+                  <button onMouseDown={(e) => { e.stopPropagation(); e.preventDefault(); if (onBeforeChange) onBeforeChange("delete crop"); setBoxes((list) => list.filter((_, k) => k !== realIdx)) }}
                     title="Remove this crop"
                     style={{ position: "absolute", top: 2, right: 2, width: 18, height: 18, borderRadius: "50%", background: "rgba(0,0,0,0.65)", color: "#fff", fontSize: 11, lineHeight: "18px" }}>✕</button>
                   {!space && HANDLES.map((h) => (

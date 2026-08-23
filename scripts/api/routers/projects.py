@@ -24,6 +24,8 @@ Endpoints
 
 from __future__ import annotations
 
+import logging
+import shutil
 import sqlite3
 from pathlib import Path
 from typing import List
@@ -35,21 +37,34 @@ from api.deps import get_db
 from api.models import OkResponse, ProjectCreate, ProjectResponse
 from database import Database
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/projects", tags=["Projects"])
 
 
 def trash_path(path: Path) -> bool:
-    """Move a file/folder to the OS Trash (recoverable). Returns True if it was
-    present and got trashed. Never raises — deleting the DB row must still
-    succeed even if the disk folder can't be removed."""
+    """Remove a file/folder, PREFERRING the OS Trash (recoverable). If send2trash
+    is unavailable or fails — e.g. a packaged runtime that didn't bundle it — fall
+    back to a permanent delete so we never silently leave an orphaned project
+    folder behind. Never raises; deleting the DB row must still succeed. Returns
+    True if the path existed and is now gone."""
+    if not path or not path.exists():
+        return False
     try:
-        if path and path.exists():
-            from send2trash import send2trash
-            send2trash(str(path))
-            return True
-    except Exception:
-        pass
-    return False
+        from send2trash import send2trash
+        send2trash(str(path))
+        return True
+    except Exception as exc:
+        logger.warning("send2trash unavailable/failed for %s (%s); removing permanently", path, exc)
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+        return not path.exists()
+    except Exception as exc:
+        logger.error("could not remove %s: %s", path, exc)
+        return False
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────
@@ -83,10 +98,10 @@ def create_project(body: ProjectCreate, db: Database = Depends(get_db)):
     """
     Create a new project.
 
-    db.add_project(name) only accepts the name and returns the existing
-    project's ID if the name already exists (IntegrityError is caught
-    internally) — so this can return either a freshly created project or
-    the pre-existing one with the same name.  notes are applied afterward.
+    db.add_project(name) always creates a DISTINCT project — if the name is
+    already taken it auto-suffixes ' (2)', ' (3)', … rather than returning the
+    existing one, so projects never share a folder/state. notes are applied
+    afterward; the response carries the actual stored title.
     """
     title = body.title.strip()
     project_id = db.add_project(title)
@@ -158,6 +173,6 @@ def delete_project(project_id: int, db: Database = Depends(get_db)):
     name = row["name"]
     folder = Path(config.OUTPUT_DIR) / str(project_id)
     db.delete_project(project_id)
-    trashed = trash_path(folder)
-    suffix = " (output moved to Trash)" if trashed else ""
+    removed = trash_path(folder)
+    suffix = " (output folder removed)" if removed else ""
     return OkResponse(ok=True, message=f"Project '{name}' deleted{suffix}")

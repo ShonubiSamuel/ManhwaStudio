@@ -31,7 +31,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from api.deps   import get_db
 from api.models import (
     VoiceInfo, DubLangOption, DubConfigResponse, DubConfigUpdate, OkResponse,
-    DubBatch, DubBatchesResponse, DubRegenBatchRequest, DubFixRequest,
+    DubBatch, DubBatchesResponse,
 )
 from pathlib import Path
 
@@ -170,11 +170,12 @@ def list_voices():
         if not p:
             continue
         out.append(VoiceInfo(
-            name     = p.name,
-            mode     = getattr(p, "mode", "") or "",
-            language = getattr(p, "language", "") or "",
-            model    = getattr(p, "model", "") or "",
-            speaker  = getattr(p, "speaker", "") or "",
+            name          = p.name,
+            mode          = getattr(p, "mode", "") or "",
+            language      = getattr(p, "language", "") or "",
+            model         = getattr(p, "model", "") or "",
+            speaker       = getattr(p, "speaker", "") or "",
+            has_reference = bool(getattr(p, "ref_wav_path", "") or ""),
         ))
     return out
 
@@ -345,50 +346,3 @@ def reset_dub_language(
     return OkResponse(ok=True, message=f"Reset {lang} dub ({n} panels) — run Dub to regenerate")
 
 
-@router.post("/dub/regenerate-batch/{episode_id}", response_model=OkResponse, status_code=202)
-def regenerate_dub_batch(
-    episode_id: int, body: DubRegenBatchRequest, db: Database = Depends(get_db),
-):
-    """
-    Regenerate ONE dub batch in the background (it re-runs that batch's TTS).
-
-    On success the batch's panel range is re-synced — for every language when
-    the batch is English (the timing reference), or that language alone
-    otherwise.  Other languages' dub audio is never touched.  Connect to
-    GET /api/pipeline/events/{id} for live progress; the terminal stage_done
-    arrives when it finishes.
-    """
-    if not db.get_episode(episode_id):
-        raise HTTPException(404, f"Episode {episode_id} not found")
-    if body.lang not in config.SUPPORTED_LANGUAGES:
-        raise HTTPException(400, f"Unknown language code: {body.lang}")
-
-    # Imported here to avoid a circular import at module load.
-    from api.routers.pipeline import launch_dub_batch_regen
-    launch_dub_batch_regen(episode_id, body.lang, body.batch_idx, db)
-
-    name = config.SUPPORTED_LANGUAGES.get(body.lang, body.lang)
-    return OkResponse(ok=True, message=f"Regenerating {name} batch {body.batch_idx + 1}…")
-
-
-@router.post("/dub/fix/{episode_id}", response_model=OkResponse, status_code=202)
-def fix_rushed_panels(
-    episode_id: int, body: DubFixRequest, db: Database = Depends(get_db),
-):
-    """
-    Fix "rushed" panels for a language in the background: for each panel whose dub
-    is too long for the English budget, re-translate it shorter, re-dub just that
-    panel, re-sync it, and keep the best of up to 3 attempts.  Omit panel_indices
-    to fix every rushed panel.  Watch progress via GET /api/pipeline/events/{id}.
-    """
-    if not db.get_episode(episode_id):
-        raise HTTPException(404, f"Episode {episode_id} not found")
-    if body.lang not in config.SUPPORTED_LANGUAGES or body.lang == "en":
-        raise HTTPException(400, f"Fix applies to a non-English language; got '{body.lang}'")
-
-    from api.routers.pipeline import launch_dub_fix
-    launch_dub_fix(episode_id, body.lang, body.panel_indices, db)
-
-    name = config.SUPPORTED_LANGUAGES.get(body.lang, body.lang)
-    scope = f"{len(body.panel_indices)} panel(s)" if body.panel_indices else "all rushed panels"
-    return OkResponse(ok=True, message=f"Fixing {name} — {scope}…")

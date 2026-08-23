@@ -2,16 +2,13 @@
 scripts/ai/openai_compat.py — generic OpenAI-compatible chat providers.
 
 One tiny client for every service that speaks the OpenAI chat-completions
-protocol behind a different base URL. Currently registered:
+protocol behind a different base URL. Groq is the only registered provider:
 
-    github  GitHub Marketplace Models  https://models.github.ai/inference
-            (auth: fine-grained PAT with the `models: read` scope)
     groq    Groq Cloud                 https://api.groq.com/openai/v1
 
 Tokens/models are read from runtime settings at call time so the caller only
 needs a provider NAME — no per-call-site key plumbing:
 
-    github_token,  github_model  (default openai/gpt-4.1)
     groq_api_key,  groq_model    (default llama-3.3-70b-versatile)
 """
 
@@ -22,13 +19,6 @@ import logging
 logger = logging.getLogger(__name__)
 
 PROVIDERS = {
-    "github": {
-        "base_url":      "https://models.github.ai/inference",
-        "key_setting":   "github_token",
-        "model_setting": "github_model",
-        "default_model": "openai/gpt-4o-mini",
-        "label":         "GitHub Models",
-    },
     "groq": {
         "base_url":      "https://api.groq.com/openai/v1",
         "key_setting":   "groq_api_key",
@@ -42,7 +32,9 @@ PROVIDERS = {
 def _client_and_model(provider: str):
     import runtime_settings as rs
     from openai import OpenAI
-    p = PROVIDERS[provider]
+    p = PROVIDERS.get(provider)
+    if not p:
+        raise RuntimeError(f"Unsupported OpenAI-compatible provider: {provider}")
     key = rs.get_str(p["key_setting"], "")
     if not key:
         raise RuntimeError(f"{p['label']}: no API token set — add it in Settings → AI & Providers.")
@@ -63,7 +55,7 @@ def call_text(prompt: str, provider: str, max_tokens: int = 4096) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
-def call_vision(prompt: str, images_b64: list, provider: str = "github",
+def call_vision(prompt: str, images_b64: list, provider: str = "groq",
                 max_tokens: int = 4096, model_override: str = "") -> str:
     """One vision call with N inline JPEG/PNG images (OpenAI image_url parts)."""
     client, model = _client_and_model(provider)

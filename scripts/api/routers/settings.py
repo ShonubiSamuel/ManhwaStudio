@@ -42,14 +42,14 @@ DEFAULTS: Dict[str, object] = {
     # ── AI & Providers ──
     "nvidia_api_key":           "",
     "nvidia_vision_model":      config.NVIDIA_VISION_MODEL,
+    "gemini_api_key":           "",
+    "gemini_vision_model":      "gemini-3.5-flash-lite",
     "ai_provider_translate":    "nvidia",
     "ai_provider_refine":       "nvidia",
-    "ai_provider_narrate":      "github",   # PDF panels → narration (vision; Recap)
+    "ai_provider_narrate":      "nvidia",   # PDF panels → narration (vision; Recap)
     "nvidia_translate_model":   config.NVIDIA_MODEL,          # NVIDIA text model for translation
     "nvidia_refine_model":      config.NVIDIA_MODEL,          # NVIDIA text model for AI Refine (+ Recap storyteller)
     "recap_batch_size":         "2",                          # panels per narration call (auto-capped per model)
-    "github_token":             "",         # fine-grained PAT, `models: read` scope
-    "github_model":             "openai/gpt-4o-mini",   # free-tier + vision; gpt-4.1 is gated
     "groq_api_key":             "",
     "groq_model":               "llama-3.3-70b-versatile",
     "nvidia_batch_size":        "30",
@@ -138,15 +138,14 @@ DEFAULTS: Dict[str, object] = {
 
 # Section grouping — six domain groups the UI renders as tabs.
 SECTIONS: Dict[str, list] = {
-    "ai_providers": ["ai_provider_translate", "nvidia_translate_model",
-                     "ai_provider_refine", "nvidia_refine_model",
-                     "ai_provider_narrate", "nvidia_vision_model", "recap_batch_size",
-                     "nvidia_api_key",
-                     "github_token", "github_model",
-                     "groq_api_key", "groq_model",
-                     "nvidia_batch_size", "nvidia_max_concurrent",
-                     "lm_studio_url", "lm_studio_model", "lm_studio_context_length",
-                     "lm_studio_max_concurrent", "lm_studio_batch_size"],
+    # One provider + ONE task-scoped model picker per task (the *_model keys are
+    # virtual in the UI: each writes the right provider-specific key). API keys
+    # live at the bottom. LM Studio was removed from the product.
+    "ai_providers": ["ai_provider_translate", "translate_model",
+                     "ai_provider_refine", "refine_model",
+                     "ai_provider_narrate", "narrate_model", "recap_batch_size",
+                     "nvidia_api_key", "gemini_api_key", "groq_api_key",
+                     "nvidia_batch_size", "nvidia_max_concurrent"],
     "voices_tts":   ["dots_weights_dir", "dots_num_steps",
                      "dots_guidance_scale", "dots_speaker_scale", "dots_seed",
                      "voice_ref_whisper_model", "tts_recommended_voice_design",
@@ -210,3 +209,94 @@ def update_settings(body: Dict[str, object], db: Database = Depends(get_db)):
     stored = db.get_all_settings()
     values = {key: stored.get(key, default) for key, default in DEFAULTS.items()}
     return {"values": values, "sections": SECTIONS}
+
+
+# ── Live model catalogs (curated per task) ────────────────────────────────────
+# The Settings UI shows ONE model field per task (Translation / Refine / Vision)
+# that follows the chosen provider and lists only models that FIT the task:
+#   vision    → multimodal models only (accept image input)
+#   translate → strong multilingual instruct LLMs
+#   refine    → strong writing/reasoning LLMs (storytelling)
+# NVIDIA/Groq catalogs are fetched live and filtered by curated family patterns.
+# Free-text entry still works in the UI for brand-new ids.
+
+_model_cache: dict = {}   # (provider, task) → {"at": ts, "models": [...]}
+_MODEL_CACHE_TTL = 600    # 10 min
+
+# Substring patterns of model FAMILIES that fit each task (matched on the id).
+_NVIDIA_VISION = ("vl", "vision", "kimi", "llava", "neva", "fuyu", "kosmos",
+                  "paligemma", "internvl", "florence", "maverick", "scout", "gemma-3")
+_TEXT_FAMILIES = ("llama-3", "llama-4", "llama3", "qwen", "mistral", "mixtral",
+                  "gemma", "deepseek", "glm", "kimi", "nemotron", "granite",
+                  "jamba", "command", "phi-4", "gpt-oss", "yi-large", "seed-oss",
+                  "exaone", "solar", "minimax")
+# Never useful for narration/translation: embeddings, rerankers, guards, ASR/TTS…
+_TEXT_EXCLUDE  = ("embed", "rerank", "guard", "safety", "clip", "ocr", "asr",
+                  "tts", "riva", "parakeet", "canary", "bge-", "nv-embed",
+                  "retriev", "moderat", "stable-diffusion", "sdxl", "genmol",
+                  "molmim", "audio", "-base", "code", "coder", "math")
+
+
+def _fits(mid: str, patterns: tuple) -> bool:
+    m = mid.lower()
+    return any(p in m for p in patterns)
+
+
+@router.get("/models/{provider}")
+def list_provider_models(provider: str, task: str = "refine", db: Database = Depends(get_db)):
+    """Curated live model list for a provider + task ('translate'|'refine'|'vision').
+    Returns {"models": [...], "cached": bool}. Empty list (never an error) when the
+    provider is unreachable or keyless — the UI falls back to free text."""
+    import time
+    import httpx
+
+    provider, task = provider.lower(), task.lower()
+    ck = (provider, task)
+    hit = _model_cache.get(ck)
+    if hit and time.time() - hit["at"] < _MODEL_CACHE_TTL:
+        return {"models": hit["models"], "cached": True}
+
+    models: list = []
+    try:
+        if provider == "nvidia":
+            key = db.get_setting("nvidia_api_key", "") or ""
+            r = httpx.get(f"{config.NVIDIA_BASE_URL.rstrip('/')}/models",
+                          headers={"Authorization": f"Bearer {key}"} if key else {},
+                          timeout=15.0)
+            r.raise_for_status()
+            ids = sorted({m.get("id", "") for m in r.json().get("data", [])} - {""})
+            if task == "vision":
+                models = [m for m in ids if _fits(m, _NVIDIA_VISION)
+                          and not _fits(m, ("embed", "clip", "ocr", "rerank"))]
+            else:
+                models = [m for m in ids if _fits(m, _TEXT_FAMILIES)
+                          and not _fits(m, _TEXT_EXCLUDE + ("-vl", "vision", "llava"))]
+            models = models or ids            # never return nothing if the fetch worked
+
+        elif provider == "gemini":
+            # Stable public Gemini vision model IDs; no catalog request needed.
+            models = ["gemini-3.5-flash-lite", "gemini-3.5-flash"] if task == "vision" else []
+
+        elif provider == "groq":
+            gk = db.get_setting("groq_api_key", "") or ""
+            if gk:
+                r = httpx.get("https://api.groq.com/openai/v1/models",
+                              headers={"Authorization": f"Bearer {gk}"}, timeout=15.0)
+                r.raise_for_status()
+                ids = sorted({m.get("id", "") for m in r.json().get("data", [])} - {""})
+                bad = ("whisper", "tts", "guard", "embed", "allam")
+                if task == "vision":
+                    models = [m for m in ids if _fits(m, ("vision", "maverick", "scout", "-vl"))]
+                else:
+                    models = [m for m in ids if not _fits(m, bad + ("vision",))]
+            else:                              # no key yet → known-good defaults
+                models = ([] if task == "vision" else
+                          ["llama-3.3-70b-versatile", "llama-3.1-8b-instant",
+                           "qwen/qwen3-32b", "moonshotai/kimi-k2-instruct",
+                           "openai/gpt-oss-120b", "openai/gpt-oss-20b"])
+    except Exception:
+        models = []   # unreachable / bad key → UI just uses the free-text input
+
+    if models:
+        _model_cache[ck] = {"at": time.time(), "models": models}
+    return {"models": models, "cached": False}

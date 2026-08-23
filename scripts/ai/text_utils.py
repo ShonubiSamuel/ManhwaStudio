@@ -210,13 +210,13 @@ def call_provider(
 
     `task` selects which per-task model to use for NVIDIA — "translate",
     "refine" or "narrate" → nvidia_<task>_model in Settings (falls back to the
-    config default). GitHub/Groq read their own model settings.
+    config default). Groq reads its own model setting.
     """
     if provider == "lm_studio":
         return lmstudio_provider.call_text(
             prompt, lm_model, max_tokens, context_length
         )
-    if provider in ("github", "groq"):
+    if provider == "groq":
         from ai import openai_compat
         return openai_compat.call_text(prompt, provider, max_tokens)
     # NVIDIA: pick the per-task model chosen in Settings.

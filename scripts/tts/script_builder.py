@@ -129,9 +129,24 @@ def build_chapter_script(
     The script is designed to run in one long-lived subprocess so that
     voice identity is guaranteed consistent across every sentence.
     """
-    model_path = str(
-        MODEL_PATHS.get(profile.model, MODEL_PATHS["1.7B-CustomVoice"])
-    )
+    # The model MUST match the mode: VoiceClone needs a clone-capable "-Base"
+    # model, VoiceDesign a "-VoiceDesign" model, CustomVoice a "-CustomVoice" one.
+    # A mismatch (e.g. a VoiceClone voice on a CustomVoice model) is a FATAL
+    # "does not support create_voice_clone_prompt". So if profile.model is missing
+    # or incompatible, use the RECOMMENDED model for the mode — never a blanket
+    # CustomVoice fallback.
+    def _mode_ok(key):
+        if not key or key not in MODEL_PATHS:
+            return False
+        if profile.mode == "VoiceClone":
+            return key.endswith("-Base")
+        if profile.mode == "VoiceDesign":
+            return key.endswith("-VoiceDesign")
+        return key.endswith("-CustomVoice")
+
+    rec_key = RECOMMENDED_MODELS.get(profile.mode, "1.7B-CustomVoice")
+    model_key = profile.model if _mode_ok(profile.model) else rec_key
+    model_path = str(MODEL_PATHS.get(model_key, MODEL_PATHS.get(rec_key, MODEL_PATHS["1.7B-CustomVoice"])))
 
     sentences_repr = "[\n" + ",\n".join(
         f'    "{_esc(s)}"' for s in sentences

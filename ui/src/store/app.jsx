@@ -31,6 +31,7 @@ export const PAGES = {
   SUBTITLE:      "subtitle",      // coming soon
   REALTIME:      "realtime",      // coming soon
   VOICES:        "voices",        // voice library
+  TTS:           "tts",           // standalone free-form text-to-speech
   SETTINGS:      "settings",
   LOGS:          "logs",
 

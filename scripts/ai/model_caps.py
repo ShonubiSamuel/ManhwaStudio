@@ -26,12 +26,8 @@ from __future__ import annotations
 MODEL_CAPS: dict = {
     # ── Multimodal (can be BOTH the "Eyes" AND the "Storyteller") ──
     "moonshotai/kimi-k2.6":                 {"max_images": 8,  "max_output": 16000, "vision": True},
-
-    # ── Vision-capable (used for the Recap "Eyes" call) ──
-    "openai/gpt-4.1":                       {"max_images": 10, "max_output": 32000, "vision": True},
-    "openai/gpt-4.1-mini":                  {"max_images": 10, "max_output": 32000, "vision": True},
-    "openai/gpt-4o":                        {"max_images": 10, "max_output": 16000, "vision": True},
-    "openai/gpt-4o-mini":                   {"max_images": 8,  "max_output": 16000, "vision": True},
+    "gemini-3.5-flash-lite":                {"max_images": 4,  "max_output": 8192,  "vision": True},
+    "gemini-3.5-flash":                     {"max_images": 4,  "max_output": 8192,  "vision": True},
 
     # ── Text reasoners (used for the Recap "Storyteller" + refine/translate) ──
     "z-ai/glm-5.2":                         {"max_images": 0, "max_output": 32000, "vision": False},

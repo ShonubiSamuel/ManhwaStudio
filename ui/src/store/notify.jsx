@@ -109,8 +109,8 @@ export function Toaster() {
             borderRadius: radius.md, padding: "10px 12px", fontSize: fonts.sm,
             fontFamily: fonts.ui, boxShadow: "0 4px 12px rgba(0,0,0,0.5)",
           }}>
-            <div style={{ flex: 1, lineHeight: 1.45 }}>
-              <div>{t.message}</div>
+            <div style={{ flex: 1, minWidth: 0, lineHeight: 1.45 }}>
+              <div style={{ overflowWrap: "anywhere", wordBreak: "break-word" }}>{t.message}</div>
               {t.action && (
                 <button
                   onClick={() => { t.action.onClick?.(); dismiss(t.id) }}
@@ -123,7 +123,7 @@ export function Toaster() {
               )}
             </div>
             <button onClick={() => dismiss(t.id)} aria-label="Dismiss"
-              style={{ background: "none", border: "none", color: s.fg, cursor: "pointer", fontSize: fonts.md, opacity: 0.7, lineHeight: 1 }}>×</button>
+              style={{ flexShrink: 0, background: "none", border: "none", color: s.fg, cursor: "pointer", fontSize: fonts.md, opacity: 0.7, lineHeight: 1 }}>×</button>
           </div>
         )
       })}

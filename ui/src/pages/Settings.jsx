@@ -18,7 +18,7 @@
  */
 
 import { useState, useEffect, useCallback, useMemo } from "react"
-import { getSettings, updateSettings } from "../api/settings"
+import { getSettings, updateSettings, listProviderModels } from "../api/settings"
 import { colors, fonts, radius } from "../theme"
 import Button from "../components/Button"
 import { TextInput } from "../components/Modal"
@@ -29,44 +29,50 @@ import { useResizableRail, RailDragHandle } from "../components/Rail"
 // type: "text" | "password" | "number" | "select" | "boolean"
 // ══════════════════════════════════════════════════════════════════════════════
 
+// Which underlying setting key a task's model picker reads/writes, per provider.
+// Mirrors scripts/api/routers/video_refine.py::_model_for_provider.
+const TASK_MODEL_KEY = {
+  nvidia: { translate: "nvidia_translate_model", refine: "nvidia_refine_model", vision: "nvidia_vision_model" },
+  gemini: { vision: "gemini_vision_model" },
+  groq:   { translate: "groq_model",   refine: "groq_model",   vision: "groq_model" },
+}
+
 const FIELDS = {
   // ── API Keys ────────────────────────────────────────────────────────────
   nvidia_api_key: {
     label: "NVIDIA API Key", type: "password",
     hint: "Get a key at build.nvidia.com → any model card → Get API Key",
   },
+  gemini_api_key: {
+    label: "Gemini API Key", type: "password",
+    hint: "Create a Google AI Studio key. Gemini 3.5 Flash-Lite accepts images on the API free tier.",
+  },
   ai_provider_narrate: {
     label: "Narration Provider (Recap vision)", type: "select",
-    options: [["github", "GitHub Models"], ["nvidia", "NVIDIA (cloud)"]],
+    options: [["nvidia", "NVIDIA (cloud)"], ["gemini", "Google Gemini (AI Studio)"]],
     hint: "Turns cropped manga panels into narration (needs a vision model)",
   },
-  nvidia_translate_model: {
-    label: "› NVIDIA Translation Model", type: "text",
-    hint: "Model used when Translation Provider = NVIDIA (e.g. meta/llama-3.1-70b-instruct)",
+  // Task-scoped model pickers. Each is VIRTUAL: it follows its task's provider
+  // select and reads/writes the right provider-specific setting key underneath
+  // (see TASK_MODEL). The dropdown lists ONLY models curated for that task.
+  translate_model: {
+    label: "Translation Model", type: "taskmodel", task: "translate",
+    providerKey: "ai_provider_translate",
+    hint: "Multilingual models good at translation, from the selected provider — pick one or type any new id",
   },
-  nvidia_refine_model: {
-    label: "› NVIDIA Refine Model", type: "text",
-    hint: "Model used when Refine Provider = NVIDIA (e.g. meta/llama-3.3-70b-instruct)",
+  refine_model: {
+    label: "Refine / Story Model", type: "taskmodel", task: "refine",
+    providerKey: "ai_provider_refine",
+    hint: "Strong writing & reasoning models (storytelling, script refine) — pick one or type any new id",
   },
-  github_token: {
-    label: "GitHub Models Token", type: "password",
-    hint: "Fine-grained PAT with the `models: read` scope — github.com/settings/tokens",
-  },
-  github_model: {
-    label: "GitHub Model", type: "text",
-    hint: "openai/gpt-4o-mini works on the free tier (gpt-4.1 is often gated → 403). Browse github.com/marketplace/models",
+  narrate_model: {
+    label: "Narration (Vision) Model", type: "taskmodel", task: "vision",
+    providerKey: "ai_provider_narrate",
+    hint: "Only multimodal models that accept images are listed — pick one or type any new id",
   },
   groq_api_key: {
     label: "Groq API Key", type: "password",
     hint: "console.groq.com → API Keys",
-  },
-  groq_model: {
-    label: "Groq Model", type: "text",
-    hint: "e.g. llama-3.3-70b-versatile",
-  },
-  nvidia_vision_model: {
-    label: "› NVIDIA Narration (Vision) Model", type: "text",
-    hint: "Model used when Narration Provider = NVIDIA (must be multimodal, e.g. moonshotai/kimi-k2.6)",
   },
   recap_batch_size: {
     label: "Recap panels per call", type: "number", min: 1, max: 8,
@@ -78,25 +84,6 @@ const FIELDS = {
   nvidia_max_concurrent: {
     label: "NVIDIA Max Concurrent", type: "number", min: 1, max: 20,
   },
-  lm_studio_url: {
-    label: "LM Studio URL", type: "text",
-    hint: "Usually http://localhost:1234/v1",
-  },
-  lm_studio_model: {
-    label: "LM Studio Model", type: "text",
-    hint: "Model identifier as loaded in LM Studio",
-  },
-  lm_studio_context_length: {
-    label: "LM Studio Context Length", type: "number", min: 1024, step: 1024,
-  },
-  lm_studio_max_concurrent: {
-    label: "LM Studio Max Concurrent", type: "number", min: 1, max: 20,
-    hint: "Match LM Studio's 'Max Concurrent Predictions' setting",
-  },
-  lm_studio_batch_size: {
-    label: "LM Studio Batch Size", type: "number", min: 1, max: 50,
-  },
-
   // ── Slicer ──────────────────────────────────────────────────────────────
   narr_mode: {
     label: "Narration Slice Mode", type: "select",
@@ -150,11 +137,11 @@ const FIELDS = {
   // ── AI providers (per-task) ───────────────────────────────────────────────
   ai_provider_translate: {
     label: "Translation Provider", type: "select",
-    options: [["nvidia", "NVIDIA (cloud)"], ["github", "GitHub Models"], ["groq", "Groq"], ["lm_studio", "LM Studio (local)"]],
+    options: [["nvidia", "NVIDIA (cloud)"], ["groq", "Groq"]],
   },
   ai_provider_refine: {
     label: "Refine Provider", type: "select",
-    options: [["nvidia", "NVIDIA (cloud)"], ["github", "GitHub Models"], ["groq", "Groq"], ["lm_studio", "LM Studio (local)"]],
+    options: [["nvidia", "NVIDIA (cloud)"], ["groq", "Groq"]],
   },
 
   // ── Voices & TTS ──────────────────────────────────────────────────────────
@@ -279,7 +266,7 @@ const SECTION_ABBR = {
 export default function Settings() {
   const [payload,    setPayload]    = useState(null)   // { values, sections }
   const [edited,     setEdited]     = useState({})     // key → new value (unsaved)
-  const [activeTab,  setActiveTab]  = useState("api_keys")
+  const [activeTab,  setActiveTab]  = useState(SECTION_ORDER[0])
   const [loading,    setLoading]    = useState(true)
   const [saving,     setSaving]     = useState(false)
   const [error,      setError]      = useState(null)
@@ -443,16 +430,35 @@ export default function Settings() {
         )}
 
         <div style={{ maxWidth: "560px" }}>
-          {sectionKeys.map(key => (
-            <Field
-              key      = {key}
-              fieldKey = {key}
-              meta     = {FIELDS[key] || { label: key, type: "text" }}
-              value    = {displayValues[key]}
-              dirty    = {key in edited}
-              onChange = {(v) => handleChange(key, v)}
-            />
-          ))}
+          {sectionKeys.map(key => {
+            const meta = FIELDS[key] || { label: key, type: "text" }
+            // Task-scoped model pickers are VIRTUAL: they follow the task's
+            // provider select and read/write the provider's own model key.
+            if (meta.type === "taskmodel") {
+              const provider = displayValues[meta.providerKey] || "nvidia"
+              const targetKey = (TASK_MODEL_KEY[provider] || {})[meta.task] || `${provider}_model`
+              return (
+                <Field
+                  key      = {key}
+                  fieldKey = {targetKey}
+                  meta     = {{ ...meta, provider }}
+                  value    = {displayValues[targetKey]}
+                  dirty    = {targetKey in edited}
+                  onChange = {(v) => handleChange(targetKey, v)}
+                />
+              )
+            }
+            return (
+              <Field
+                key      = {key}
+                fieldKey = {key}
+                meta     = {meta}
+                value    = {displayValues[key]}
+                dirty    = {key in edited}
+                onChange = {(v) => handleChange(key, v)}
+              />
+            )
+          })}
         </div>
       </div>
     </div>
@@ -461,7 +467,7 @@ export default function Settings() {
 
 function sectionHint(section) {
   switch (section) {
-    case "api_keys":  return "NVIDIA NIM and LM Studio connection settings."
+    case "ai_providers": return "Pick a provider per task — each model list shows only models suited to that task. API keys live below."
     case "slicer":    return "How PDF pages are sliced and prepared for AI narration."
     case "optimizer": return "Image compression settings for AI model uploads."
     case "detection":  return "Video panel detection thresholds and transcription settings."
@@ -494,6 +500,9 @@ function Field({ meta, value, dirty, onChange }) {
         <Toggle checked={!!value} onChange={onChange} />
       ) : meta.type === "select" ? (
         <Select options={meta.options} value={value} onChange={onChange} />
+      ) : meta.type === "taskmodel" ? (
+        // key: remount when the provider flips so the old provider's list never lingers
+        <ModelField key={`${meta.provider}:${meta.task}`} provider={meta.provider} task={meta.task} value={value ?? ""} onChange={onChange} />
       ) : meta.type === "password" ? (
         <TextInput
           type        = "password"
@@ -522,6 +531,82 @@ function Field({ meta, value, dirty, onChange }) {
       {meta.hint && (
         <div style={{ color: colors.muted, fontSize: fonts.xs, marginTop: 4 }}>
           {meta.hint}
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+// ── Model picker (live provider catalog + free text) ─────────────────────────
+// A combobox for model ids: a searchable dropdown of every model the provider
+// currently serves (fetched live, shared across fields via a module cache) that
+// also accepts free text — so a brand-new model works before the catalog knows it.
+
+const _catalogCache = {}   // "provider:task" → Promise<string[]>
+function fetchCatalog(provider, task) {
+  const ck = `${provider}:${task}`
+  if (!_catalogCache[ck]) {
+    _catalogCache[ck] = listProviderModels(provider, task)
+      .then((r) => r.models || [])
+      .catch(() => { delete _catalogCache[ck]; return [] })
+  }
+  return _catalogCache[ck]
+}
+
+function ModelField({ provider, task, value, onChange }) {
+  const [models, setModels] = useState([])
+  const [open, setOpen] = useState(false)
+  const [filter, setFilter] = useState("")
+
+  useEffect(() => {
+    let alive = true
+    fetchCatalog(provider, task).then((m) => { if (alive) setModels(m) })
+    return () => { alive = false }
+  }, [provider, task])
+
+  const shown = useMemo(() => {
+    const q = filter.trim().toLowerCase()
+    const list = q ? models.filter((m) => m.toLowerCase().includes(q)) : models
+    return list.slice(0, 200)
+  }, [models, filter])
+
+  return (
+    <div style={{ position: "relative" }}>
+      <div style={{ display: "flex", gap: 6 }}>
+        <TextInput
+          type="text"
+          value={value}
+          placeholder={models.length ? "Pick from the list or type a model id…" : "Type a model id…"}
+          onChange={(e) => { onChange(e.target.value); setFilter(e.target.value); setOpen(true) }}
+          onFocus={() => { setFilter(""); setOpen(true) }}
+          onBlur={() => setTimeout(() => setOpen(false), 150)}
+          style={{ flex: 1 }}
+        />
+        <button
+          onMouseDown={(e) => { e.preventDefault(); setFilter(""); setOpen((o) => !o) }}
+          title={models.length ? `${models.length} models available` : "Catalog unavailable — type the id"}
+          style={{ background: colors.panel2, border: `1px solid ${colors.border}`, color: colors.textDim,
+                   borderRadius: radius.md, padding: "0 12px", cursor: "pointer", flexShrink: 0 }}>
+          ▾
+        </button>
+      </div>
+      {open && shown.length > 0 && (
+        <div style={{ position: "absolute", top: "100%", left: 0, right: 0, zIndex: 40, marginTop: 4,
+                      maxHeight: 260, overflowY: "auto", background: colors.panel,
+                      border: `1px solid ${colors.border}`, borderRadius: radius.md,
+                      boxShadow: "0 8px 24px rgba(0,0,0,0.45)" }}>
+          {shown.map((m) => (
+            <div key={m}
+              onMouseDown={(e) => { e.preventDefault(); onChange(m); setOpen(false) }}
+              style={{ padding: "7px 12px", cursor: "pointer", fontSize: fonts.sm,
+                       color: m === value ? colors.accent : colors.text,
+                       background: m === value ? colors.panel2 : "transparent" }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = colors.panel2 }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = m === value ? colors.panel2 : "transparent" }}>
+              {m}
+            </div>
+          ))}
         </div>
       )}
     </div>

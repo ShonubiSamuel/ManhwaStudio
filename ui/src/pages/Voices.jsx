@@ -210,9 +210,12 @@ function CloneVoiceModal({ languages, onClose, onCreated }) {
     try {
       const v = await createVoice({ name: name.trim(), language })
       notify({ severity: "info", message: "Processing reference audio..." })
-      await setVoiceReference(v.name, refPath, transcribe)
+      // setVoiceReference flips the profile to VoiceClone (+ a -Base model) and
+      // returns the UPDATED profile — use THAT, not the pre-reference `v` (which is
+      // still the CustomVoice default), or the panel shows the wrong mode/engine.
+      const updated = await setVoiceReference(v.name, refPath, transcribe)
       notify({ severity: "success", message: `Voice "${v.name}" cloned successfully!` })
-      onCreated(v)
+      onCreated(updated || v)
     } catch (e) {
       notify({ severity: "error", message: e.message })
       setBusy(false)
@@ -306,7 +309,11 @@ function VoiceDetailsPanel({ voice, onClose, onDelete, onUpdated, testState, set
           <div style={{ display: "grid", gridTemplateColumns: "100px 1fr", gap: "8px", fontSize: fonts.sm }}>
             <div style={{ color: colors.textDim }}>Mode</div><div style={{ color: colors.text }}>{voice.mode || "—"}</div>
             <div style={{ color: colors.textDim }}>Engine</div><div style={{ color: colors.text }}>{voice.model || "—"}</div>
-            <div style={{ color: colors.textDim }}>Speaker ID</div><div style={{ color: colors.text }}>{voice.speaker || "—"}</div>
+            {voice.mode === "CustomVoice"
+              ? (<><div style={{ color: colors.textDim }}>Speaker ID</div><div style={{ color: colors.text }}>{voice.speaker || "—"}</div></>)
+              : (voice.has_reference || voice.ref_wav_path)
+                ? (<><div style={{ color: colors.textDim }}>Reference</div><div style={{ color: colors.text }}>✓ cloned from audio</div></>)
+                : null}
           </div>
         </div>
 

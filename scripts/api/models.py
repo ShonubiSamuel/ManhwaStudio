@@ -202,11 +202,12 @@ class PanelUpdateResult(BaseModel):
 
 class VoiceInfo(BaseModel):
     """One voice profile from VoiceProfileManager (GET /api/voices)."""
-    name:     str
-    mode:     str = ""        # CustomVoice | VoiceDesign | VoiceClone
-    language: str = ""
-    model:    str = ""
-    speaker:  str = ""
+    name:          str
+    mode:          str = ""        # CustomVoice | VoiceDesign | VoiceClone
+    language:      str = ""
+    model:         str = ""
+    speaker:       str = ""
+    has_reference: bool = False     # True when a clone reference clip is attached
 
 
 class VoiceProfileDetail(BaseModel):
@@ -261,18 +262,18 @@ class QuickTTSRequest(BaseModel):
     lang_code:  Optional[str] = None # subfolder name for the project's dub output
 
 
+class TTSRenderRequest(BaseModel):
+    """Free-form text rendered from the standalone TTS workspace."""
+    text: str = Field(..., min_length=1)
+    voice: str
+    language: Optional[str] = None   # optional override for the voice profile
+
+
 class VoiceDesignRequest(BaseModel):
     """Synthesize a reference clip from a text persona (Qwen3 VoiceDesign)."""
     instruct: str                    # the persona description
     text:     str                    # what the sample clip should say
     language: str = "English"
-
-
-class AdhocDubRequest(BaseModel):
-    """Dub a free-form multi-line script with one voice (active engine)."""
-    text:     str
-    voice:    str
-    language: Optional[str] = None
 
 
 class QuickTTSJob(BaseModel):
@@ -350,18 +351,6 @@ class DubBatchesResponse(BaseModel):
     voice:       str = ""
     batch_size:  int = 5
     batches:     List[DubBatch] = []
-
-
-class DubRegenBatchRequest(BaseModel):
-    """Regenerate a single dub batch (heavy — runs in the background)."""
-    lang:      str
-    batch_idx: int
-
-
-class DubFixRequest(BaseModel):
-    """Fix rushed panels: re-translate shorter → re-dub → re-sync (best of N)."""
-    lang:          str
-    panel_indices: Optional[List[int]] = None   # omit → fix all rushed panels
 
 
 class SyncBatch(BaseModel):
@@ -554,6 +543,8 @@ class AdhocSyncJob(BaseModel):
     message: str = ""
     synced_audio_url: str = ""
     updated_cues: Optional[List[dict]] = None
+    audio_durs: Optional[List[float]] = None   # per-cue actual audio length (silence-gap view)
+    audio_keys: Optional[List[Optional[str]]] = None  # per-cue clip version id (for audio undo);
+                                                       # None entry = this cue's clip was not (re)made
     log: List[dict] = []
     error: str = ""
-

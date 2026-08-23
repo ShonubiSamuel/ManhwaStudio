@@ -14,13 +14,14 @@
  */
 
 import { useState, useEffect, useRef, useCallback, useMemo, forwardRef } from "react"
-import { listVoices, getLanguages } from "../api/voices"
-import { startAdhocTranslate, getAdhocTranslateStatus, getAdhocSyncStatus, startDubCues, startRedubCue, refineCue, refineScript, getDubSession, saveDubSession, exportDub, startTranslateCues } from "../api/speech"
+import { listVoices, getLanguages, quickTTS, quickTTSStatus } from "../api/voices"
+import { startAdhocTranslate, getAdhocTranslateStatus, getAdhocSyncStatus, startDubCues, startRedubCue, startRedubCues, startRestoreAudio, refineCue, refineScript, getDubSession, saveDubSession, exportDub, startTranslateCues } from "../api/speech"
 import { listProjects } from "../api/projects"
 import { useApp, actions, PAGES } from "../store/app"
 import { useNotify } from "../store/notify"
-import { savePanel, deletePanel, upscaleAll, getUpscaleStatus, narratePanels, getRecapState, saveRecapState, getNarratePlan } from "../api/videoRefine"
+import { savePanel, upscaleAll, getUpscaleStatus, narrateAll, getRecapState, saveRecapState, getNarratePlan, getStoryMemory, updateStoryCharacter, deleteStoryCharacter, undoStoryMemory, redoStoryMemory, getMagiStatus, installMagi } from "../api/videoRefine"
 import { FILES_ORIGIN, mediaSrc } from "../api/panels"
+import { importPdf } from "../api/media"
 import { colors, fonts, radius } from "../theme"
 import Button from "../components/Button"
 import PdfReader from "../components/PdfReader"
@@ -50,7 +51,6 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
   const [targetLang, setTargetLang] = useState("French")
   const [sourcePath, setSourcePath] = useState("")
   const [voice, setVoice] = useState("")
-  const [reviewed, setReviewed] = useState([])
   const [pdfPath, setPdfPath] = useState("")   // Video Refine only (manga PDF)
   // Video Refine multi-language: a project can hold several languages, each with
   // its own voice; the active one drives targetLang/voice/translated/ttsAudioUrl.
@@ -80,23 +80,30 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
         if (s.voice)       setVoice(s.voice)
         if (s.ttsAudioUrl) setTtsAudioUrl(s.ttsAudioUrl)
         if (s.pdfPath)     setPdfPath(s.pdfPath)
-        if (Array.isArray(s.reviewed)) setReviewed(s.reviewed)
         // Multi-language: use the saved list, else migrate the single language.
         let langs = Array.isArray(s.languages) && s.languages.length
           ? s.languages
           : (s.targetLang ? [{ name: s.targetLang, voice: s.voice || "" }] : [])
-        // Migration: older Video Refine sessions never seeded the ORIGINAL
-        // language into the list, so English was unselectable (no way to refine
-        // + dub the baseline). Insert it at the top.
-        const srcName = s.sourceLang || "English"
-        if (refine && !langs.some((l) => l.name === srcName)) {
+        // Video Refine keeps an English baseline (the video's original audio).
+        // Recap makes NO language assumption — the FIRST language the user adds
+        // becomes the original, so a fresh recap starts with an empty list.
+        const isRecap = s.kind === "recap"
+        const srcName = s.sourceLang || (isRecap ? "" : "English")
+        if (refine && srcName && !langs.some((l) => l.name === srcName)) {
           langs = [{ name: srcName, voice: s.voice || "" }, ...langs]
         }
         setLanguages(langs)
-        setSelectedLang(s.selectedLang || langs[0]?.name || s.targetLang || "")
+        const sel = s.selectedLang || langs[0]?.name || s.targetLang || ""
+        setSelectedLang(sel)
+        // Recap / Video Refine: the ACTIVE language IS the dub target, so keep
+        // targetLang in sync with it on load. Otherwise a stale "French" default
+        // (or a saved stale value) makes an English narration dub land in the French
+        // folder and skips the timeline repack (which needs targetLang === sourceLang).
+        if (refine && sel) setTargetLang(sel)
         setDubUrls(s.dubUrls || (s.ttsAudioUrl && s.targetLang ? { [s.targetLang]: s.ttsAudioUrl } : {}))
         if (s.speakersMap) setSpeakersMap(s.speakersMap)
         if (s.sourceLang) setSourceLang(s.sourceLang)
+        else if (isRecap) setSourceLang("")   // fresh recap: no assumed original language
         if (Array.isArray(s.staleTimingLangs)) setStaleTimingLangs(s.staleTimingLangs)
         if (s.kind) setKind(s.kind)
         if (Array.isArray(s.recapBoxes)) setRecapBoxes(s.recapBoxes)
@@ -143,13 +150,13 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
     if (!loaded) return
     const t = setTimeout(() => {
       saveDubSession(projectId, {
-        cues: cues || [], ttsAudioUrl, targetLang, sourcePath, voice, reviewed, pdfPath,
+        cues: cues || [], ttsAudioUrl, targetLang, sourcePath, voice, pdfPath,
         languages, selectedLang, dubUrls, speakersMap, sourceLang, staleTimingLangs, kind, recapBoxes,
         updatedAt: Date.now(),
       }).catch(() => { /* best-effort; next change retries */ })
     }, 700)
     return () => clearTimeout(t)
-  }, [loaded, cues, ttsAudioUrl, targetLang, sourcePath, voice, reviewed, pdfPath, languages, selectedLang, dubUrls, speakersMap, sourceLang, staleTimingLangs, kind, recapBoxes, projectId])
+  }, [loaded, cues, ttsAudioUrl, targetLang, sourcePath, voice, pdfPath, languages, selectedLang, dubUrls, speakersMap, sourceLang, staleTimingLangs, kind, recapBoxes, projectId])
 
   // Voices + the shared dub-generation pipeline (TTS → sync). Used by BOTH the
   // setup screen's "Start Dubbing" and the editor's "Regenerate Dub", so a fresh
@@ -168,7 +175,7 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
   const generateDub = useCallback(async (cuesArg, resumeJobId = null) => {
     const useCues = cuesArg || cues
     if (!useCues || !useCues.length) return
-    const useVoice = voice || voices[0]?.name
+    const useVoice = voice || voiceForLang(voices, targetLang)
     if (!useVoice) { notify({ severity: "error", message: "No voice available — add one under Voices first." }); return }
     setBusy(true)
     try {
@@ -185,8 +192,17 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
         cur = await getAdhocSyncStatus(jobId)
       } else {
         const payloadCues = useCues.map(c => ({ ...c, voice: speakersMap[c.speaker] || useVoice }))
-        const repackTimings = refine && targetLang === sourceLang
-        const start = await startDubCues(payloadCues, useVoice, targetLang, projectId, repackTimings)
+        // Recap timeline authority: the ORIGINAL (source-language) dub locks the
+        // cue timeline from its REAL audio (gapless split); translated dubs then fit
+        // into it. Also lock on the first dub when the original hasn't been generated
+        // yet — otherwise the cues stay on the provisional text-length estimate, whose
+        // slots are far longer than the actual audio.
+        const timelineLocked = !!dubUrls[sourceLang]
+        const repackTimings = refine && (targetLang === sourceLang || !timelineLocked)
+        // Recap: one clip per panel (never merge cues into a single read), so each
+        // panel gets its own audio with real silence between.
+        const group = kind !== "recap"
+        const start = await startDubCues(payloadCues, useVoice, targetLang, projectId, repackTimings, group)
         cur = start
         jobId = start.job_id
         localStorage.setItem(lsKey, jobId)
@@ -209,9 +225,20 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
       setDubUrls((d) => ({ ...d, [targetLang]: url }))   // remember this language's dub
       // Mark every cue as "dubbed" (clean) so later edits can show a per-cue Redub.
       // If the backend repacked the timings (Video Refine original lang), use those updated cues.
+      const audioDurs = cur.audio_durs || []
+      const audioKeys = cur.audio_keys || []
       setCues((prev) => {
         const baseCues = cur.updated_cues || prev
-        return baseCues.map((c, i) => ({ ...c, dubbed: c.translated || prev[i]?.translated, dubbedVoice: speakersMap[c.speaker] || useVoice }))
+        return baseCues.map((c, i) => ({
+          ...c,
+          dubbed: c.translated || prev[i]?.translated,
+          dubbedVoice: speakersMap[c.speaker] || useVoice,
+          // Remember THIS language's real audio length per cue → the timeline can
+          // show the silence gap after a short translated line.
+          audioDurs: { ...(c.audioDurs || {}), [targetLang]: audioDurs[i] },
+          // …and this clip's version key, so undo/redo can restore its audio.
+          audioKeys: audioKeys[i] ? { ...(c.audioKeys || {}), [targetLang]: audioKeys[i] } : (c.audioKeys || {}),
+        }))
       })
       // Timeline honesty: repacking the SOURCE dub moves every cue's slot, so any
       // other language's existing dub was fit to timing that no longer exists —
@@ -231,7 +258,7 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
       setBusy(false)
       setStatusMsg("")
     }
-  }, [cues, voice, voices, targetLang, projectId, speakersMap, refine, sourceLang, languages, dubUrls])
+  }, [cues, voice, voices, targetLang, projectId, speakersMap, refine, sourceLang, languages, dubUrls, kind])
 
   // Extraction finished → load cues into the editor. Voiceover dubs immediately;
   // Video Refine just transcribes (you AI-Refine first, then translate + dub).
@@ -265,7 +292,7 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
   const redubOne = useCallback(async (idx, cuesOverride, resumeJobId = null) => {
     const cuesNow = cuesOverride || cues
     if (!cuesNow[idx]) return
-    const useVoice = voice || voices[0]?.name
+    const useVoice = voice || voiceForLang(voices, targetLang)
     if (!useVoice) { notify({ severity: "error", message: "No voice available." }); return }
     setRedubbing((s) => { const n = new Set(s); n.add(idx); return n })
     try {
@@ -278,7 +305,7 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
         cur = await getAdhocSyncStatus(jobId)
       } else {
         const payloadCues = cuesNow.map(c => ({ ...c, voice: speakersMap[c.speaker] || useVoice }))
-        const start = await startRedubCue(projectId, useVoice, targetLang, payloadCues, idx)
+        const start = await startRedubCue(projectId, useVoice, targetLang, payloadCues, idx, kind !== "recap")
         cur = start
         jobId = start.job_id
         localStorage.setItem(lsKey, jobId)
@@ -290,7 +317,20 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
       }
       localStorage.removeItem(lsKey)
       if (!cur || cur.status === "failed") throw new Error((cur && cur.error) || "Redub failed")
-      setCues((prev) => prev.map((x, i) => (i === idx ? { ...x, dubbed: x.translated, dubbedVoice: speakersMap[x.speaker] || useVoice } : x)))
+      // Apply the fresh per-cue durations (timeline split) and clip version keys
+      // (audio undo). Redub reassembles the whole track, so durations can shift on
+      // every cue; keys change only for the re-voiced group (null = keep existing).
+      const newDurs = cur.audio_durs || []
+      const newKeys = cur.audio_keys || []
+      const dursOk = newDurs.length === (cuesNow.length)
+      setCues((prev) => prev.map((x, i) => {
+        const patch = dursOk ? { audioDurs: { ...(x.audioDurs || {}), [targetLang]: newDurs[i] } } : {}
+        const key = newKeys[i]
+        if (key) patch.audioKeys = { ...(x.audioKeys || {}), [targetLang]: key }
+        return i === idx
+          ? { ...x, dubbed: x.translated, dubbedVoice: speakersMap[x.speaker] || useVoice, ...patch }
+          : { ...x, ...patch }
+      }))
       const base = (cur.synced_audio_url || "").split("?")[0]
       if (base) setTtsAudioUrl(`${base}?v=${Date.now()}`)
       notify({ severity: "success", message: `Cue ${idx + 1} re-voiced` })
@@ -299,7 +339,70 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
     } finally {
       setRedubbing((s) => { const n = new Set(s); n.delete(idx); return n })
     }
-  }, [cues, voice, voices, targetLang, projectId, speakersMap])
+  }, [cues, voice, voices, targetLang, projectId, speakersMap, kind])
+
+  // Batch redub: re-voice SEVERAL cues, then reassemble the track ONCE (the
+  // backend masters a single time instead of per-cue). Used by batch AI-Fix.
+  const redubMany = useCallback(async (indices, cuesOverride) => {
+    const cuesNow = cuesOverride || cues
+    const useVoice = voice || voiceForLang(voices, targetLang)
+    if (!useVoice) { notify({ severity: "error", message: "No voice available." }); return }
+    const idxs = [...new Set(indices)].filter((i) => cuesNow[i])
+    if (!idxs.length) return
+    const idxSet = new Set(idxs)
+    setRedubbing((s) => { const n = new Set(s); idxs.forEach((i) => n.add(i)); return n })
+    try {
+      const payloadCues = cuesNow.map((c) => ({ ...c, voice: speakersMap[c.speaker] || useVoice }))
+      const start = await startRedubCues(projectId, useVoice, targetLang, payloadCues, idxs, kind !== "recap")
+      let cur = start
+      const jobId = start.job_id
+      while (cur && cur.status === "running") { await sleep(1200); cur = await getAdhocSyncStatus(jobId) }
+      if (!cur || cur.status === "failed") throw new Error((cur && cur.error) || "Redub failed")
+      const newDurs = cur.audio_durs || []
+      const newKeys = cur.audio_keys || []
+      const dursOk = newDurs.length === cuesNow.length
+      setCues((prev) => prev.map((x, i) => {
+        const patch = dursOk ? { audioDurs: { ...(x.audioDurs || {}), [targetLang]: newDurs[i] } } : {}
+        const key = newKeys[i]
+        if (key) patch.audioKeys = { ...(x.audioKeys || {}), [targetLang]: key }
+        return idxSet.has(i)
+          ? { ...x, dubbed: x.translated, dubbedVoice: speakersMap[x.speaker] || useVoice, ...patch }
+          : { ...x, ...patch }
+      }))
+      const base = (cur.synced_audio_url || "").split("?")[0]
+      if (base) setTtsAudioUrl(`${base}?v=${Date.now()}`)
+      notify({ severity: "success", message: `Re-voiced ${idxs.length} cue(s)` })
+    } catch (err) {
+      notify({ severity: "error", message: err.message })
+    } finally {
+      setRedubbing((s) => { const n = new Set(s); idxs.forEach((i) => n.delete(i)); return n })
+    }
+  }, [cues, voice, voices, targetLang, projectId, speakersMap, kind])
+
+  // Audio undo/redo: restore the track to a snapshot's clip versions. The editor's
+  // undo/redo (which lives in AdvancedEditor) calls this with the target snapshot's
+  // cues; we ask the backend to copy each cue's archived clip back and reassemble.
+  // A token guards against races when the user undoes/redoes quickly.
+  const restoreTokenRef = useRef(0)
+  const restoreAudioTo = useCallback(async (targetCues) => {
+    const lang = targetLang
+    const useVoice = voice || voiceForLang(voices, targetLang)
+    if (!useVoice || !Array.isArray(targetCues)) return
+    const keys = targetCues.map((c) => c.audioKeys?.[lang] || null)
+    if (!keys.some(Boolean)) return   // nothing was archived for this language → can't restore
+    const myToken = ++restoreTokenRef.current
+    try {
+      const payloadCues = targetCues.map((c) => ({ ...c, voice: speakersMap[c.speaker] || useVoice }))
+      const start = await startRestoreAudio(projectId, useVoice, lang, payloadCues, keys, kind !== "recap")
+      let cur = start
+      while (cur && cur.status === "running") { await sleep(1200); cur = await getAdhocSyncStatus(cur.job_id) }
+      if (myToken !== restoreTokenRef.current) return   // a newer undo/redo superseded this one
+      if (cur && cur.status === "done") {
+        const base = (cur.synced_audio_url || "").split("?")[0]
+        if (base) setTtsAudioUrl(`${base}?v=${Date.now()}`)
+      }
+    } catch { /* best-effort; visuals already reverted */ }
+  }, [voice, voices, targetLang, projectId, speakersMap, kind])
 
   // ── Multi-language (Video Refine) ─────────────────────────────────────────
   // Make `lang` the active language: its voice + per-cue translation + dub drive
@@ -310,7 +413,9 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
     setSelectedLang(name); setTargetLang(name); setVoice(v)
     setTtsAudioUrl(dubUrls[name] || "")
     const hasDub = !!dubUrls[name]
-    setCues((prev) => prev.map((c, i, arr) => {
+    // `cues` is null on a brand-new project — guard it, or adding the first
+    // language (before any narration) blank-screens the app (null.map()).
+    setCues((prev) => (prev || []).map((c, i, arr) => {
       const t = c.translations?.[name] || ""
       const dur = effDur(arr, i)
       const cps = computeCps(t, dur)
@@ -319,6 +424,9 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
   }, [languages, dubUrls])
 
   const addLanguage = useCallback((name, voiceName) => {
+    // The FIRST language added is the ORIGINAL (source) language — this is how a
+    // recap picks its original without us assuming English.
+    setSourceLang((sl) => sl || name)
     setLanguages((prev) => {
       const next = prev.some((l) => l.name === name)
         ? prev.map((l) => (l.name === name ? { name, voice: voiceName } : l))
@@ -424,9 +532,8 @@ export function ProjectDubStudio({ projectId, onBack, refine = false }) {
       ttsAudioUrl={ttsAudioUrl}
       targetLang={targetLang} setTargetLang={setTargetLang}
       voice={voice} setVoice={setVoice} voices={voices}
-      reviewed={reviewed} setReviewed={setReviewed}
       generateDub={generateDub} busy={busy} statusMsg={statusMsg}
-      redubOne={redubOne} redubbing={redubbing}
+      redubOne={redubOne} redubMany={redubMany} restoreAudioTo={restoreAudioTo} redubbing={redubbing}
       refineMode={refine} pdfPath={pdfPath} setPdfPath={setPdfPath}
       languages={languages} selectedLang={selectedLang} onSwitchLang={activateLang}
       onAddLanguage={addLanguage} onTranslate={translateToSelected} translating={translating}
@@ -625,8 +732,9 @@ function useSplitter({ initial, min, max, axis }) {
    Advanced editor
 ───────────────────────────────────────────────────────────────────────────── */
 
-function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudioUrl, targetLang, voice, setVoice, voices, reviewed, setReviewed, generateDub, busy, statusMsg, redubOne, redubbing, refineMode = false, pdfPath = "", setPdfPath = () => {}, languages = [], selectedLang = "", onSwitchLang = () => {}, onAddLanguage = () => {}, onTranslate = () => {}, translating = false, speakersMap = {}, setSpeakersMap = () => {}, sourceLang = "English", dubUrls = {}, staleTimingLangs = [], recapMode = false, recapBoxes = [], setRecapBoxes = () => {} }) {
+function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudioUrl, targetLang, voice, setVoice, voices, generateDub, busy, statusMsg, redubOne, redubMany = () => {}, restoreAudioTo = () => {}, redubbing, refineMode = false, pdfPath = "", setPdfPath = () => {}, languages = [], selectedLang = "", onSwitchLang = () => {}, onAddLanguage = () => {}, onTranslate = () => {}, translating = false, speakersMap = {}, setSpeakersMap = () => {}, sourceLang = "English", dubUrls = {}, staleTimingLangs = [], recapMode = false, recapBoxes = [], setRecapBoxes = () => {} }) {
   const { notify } = useNotify()
+  const pdfInputRef = useRef(null)
   const [exporting, setExporting] = useState(false)
   const [speakerModalOpen, setSpeakerModalOpen] = useState(false)
   const [mergeModalTarget, setMergeModalTarget] = useState(null)
@@ -643,47 +751,67 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
   const [narrPrompt, setNarrPrompt] = useState(
     "Write an engaging, dramatic third-person recap narration in present tense — punchy, flowing, like a top manhwa recap channel.")
   const [castSeed, setCastSeed] = useState("")            // authoritative cast list (names + looks)
-  const [registry, setRegistry] = useState({ characters: [] })
   const [resetMemory, setResetMemory] = useState(false)  // start a fresh chapter
-  const [registryOpen, setRegistryOpen] = useState(false)
+  const [storyMemoryOpen, setStoryMemoryOpen] = useState(false)
+  const [storyMemory, setStoryMemory] = useState({ characters: [], events: [] })
+  const [magi, setMagi] = useState({ installed: false })
+  const [useMagi, setUseMagi] = useState(false)
+  const [installingMagi, setInstallingMagi] = useState(false)
+  // The language the narration is written in. On the FIRST narration it becomes
+  // the project's original language; on later chapters it's fixed to that.
+  const [langOptions, setLangOptions] = useState([])     // [{code,name,engine}]
+  const [narrateLang, setNarrateLang] = useState("")
 
-  // Load the project's character registry + cast seed once (Recap mode).
+  useEffect(() => {
+    if (!recapMode) return
+    getLanguages().then((l) => setLangOptions(l || [])).catch(() => {})
+  }, [recapMode])
+
+  // The cast seed is optional authored context. Canonical identities themselves
+  // live in Story Memory, not in the retired registry editor.
   useEffect(() => {
     if (!recapMode) return
     getRecapState(projectId).then((s) => {
-      setRegistry(s?.registry || { characters: [] })
       setCastSeed(s?.cast_seed || "")
+    }).catch(() => {})
+    getMagiStatus().then((status) => {
+      setMagi(status || { installed: false })
+      setUseMagi(!!status?.installed)
     }).catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, recapMode])
 
   const runNarration = async () => {
     const crops = (pendingCrops || []).filter((c) => c && c.data && c.data.length > 200)
+    // Narration language: fixed to the original once set (later chapters), else the
+    // one chosen in the Narrate window (defaulting to the first listed). That choice
+    // DEFINES the original language.
+    const origLang = sourceLang || narrateLang || langOptions[0]?.name || ""
+    if (!origLang) {
+      setPendingCrops(null)
+      notify({ severity: "error", message: "Choose the narration language first." })
+      return
+    }
     setPendingCrops(null)
     if (!crops.length) { notify({ severity: "error", message: "No usable crops to narrate." }); return }
     setNarrating(true)
     try {
       // Persist the cast seed first so the pipeline's identity resolver uses it.
       await saveRecapState(projectId, { cast_seed: castSeed }).catch(() => {})
-      // Batch size adapts to the ACTUAL model: the backend caps our preference to
-      // what the vision model accepts (a 1-image model → 1). The registry + story
-      // memory carry forward server-side, so narration stays name-aware.
-      const plan = await getNarratePlan().catch(() => ({ effective_batch: 2 }))
-      const BATCH = Math.max(1, plan.effective_batch || 2)
+      // Whole-chapter pass: the backend reads EVERY panel (vision chunked to the
+      // model's image limit), resolves identities with full-chapter hindsight, then
+      // narrates every panel in one go. Registry + rolling summary persist server-side.
+      const plan = await getNarratePlan().catch(() => ({}))
       if (plan.vision_model) {
-        notify({ severity: "info", message: `Vision: ${plan.vision_model} · Story: ${plan.reasoner_model} · ${BATCH} panel(s)/call` })
+        notify({ severity: "info", message: `Vision: ${plan.vision_model} · Story: ${plan.reasoner_model} · whole-chapter pass` })
       }
-      const startIdx = (cues || []).length            // append: chapter by chapter
       const lines = new Array(crops.length).fill("")
-      let latestRegistry = registry
-      for (let s = 0; s < crops.length; s += BATCH) {
-        notify({ severity: "info", message: `Narrating panels ${s + 1}–${Math.min(s + BATCH, crops.length)} of ${crops.length}…` })
-        const batch = crops.slice(s, s + BATCH).map((c, k) => ({ index: s + k, data: c.data }))
-        const res = await narratePanels(projectId, narrPrompt, batch, s === 0 && resetMemory)
-        for (const l of res.lines || []) lines[l.index] = l.text || ""
-        if (res.registry) latestRegistry = res.registry
-      }
-      setRegistry(latestRegistry)
+      notify({ severity: "info", message: `Narrating all ${crops.length} panel(s) — watch the Logs page for live progress…` })
+      // Narrate in the chosen original language (no assumption of English).
+      const langDirective = origLang && origLang.toLowerCase() !== "english"
+        ? `\n\nIMPORTANT: Write the narration in ${origLang}.` : ""
+      const res = await narrateAll(projectId, narrPrompt + langDirective, crops.map((c, k) => ({ index: k, data: c.data })), resetMemory, useMagi)
+      for (const l of res.lines || []) lines[l.index] = l.text || ""
       setResetMemory(false)
       // Save each crop as its cue's panel, then append the new cues. Timing is a
       // provisional estimate — the ENGLISH dub repack defines the real timeline.
@@ -691,27 +819,63 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
       let t = (cues || []).reduce((m, c) => Math.max(m, c.end ?? 0), 0)
       if (t > 0) t += 0.5
       for (let i = 0; i < crops.length; i++) {
-        const saved = await savePanel(projectId, startIdx + i, crops[i].data)
+        // Stable panel id (NOT the array index): survives cue deletion/reorder
+        // without ever colliding with another cue's panel file on disk.
+        const pid = newPanelId(i)
+        const saved = await savePanel(projectId, pid, crops[i].data)
         const text = lines[i] || ""
         const dur = Math.max(2.5, Math.min(14, text.length / 15))
         newCues.push({
-          // The narration seeds BOTH the original and the source-language slot,
-          // so the English dub can generate immediately (AI Refine optional).
-          text, translated: text, translations: { [sourceLang]: text }, speaker: "Speaker 0",
+          // The narration is the ORIGINAL-language text — stored under that
+          // language's slot so its dub can generate immediately (AI Refine optional).
+          text, translated: text, translations: { [origLang]: text }, speaker: "Speaker 0",
           start: +t.toFixed(2), end: +(t + dur).toFixed(2),
           sourceStart: +t.toFixed(2), sourceEnd: +(t + dur).toFixed(2),
           // eslint-disable-next-line react-hooks/purity -- event handler, not render (cache-bust query)
           image: (saved.image || "") + `?v=${Date.now()}`, raw: saved.raw || "",
+          // The cue now OWNS its panel: stable file id + the source crop geometry,
+          // so its panel can be re-edited later without touching any other cue.
+          panelId: pid, panelBox: crops[i].box || null,
         })
         t += dur + 0.3
       }
-      setUndoStack((st) => [...st, cues]); setRedoStack([])
+      // One atomic undo step: narration converts the staged boxes into cues that
+      // own them, so the global cropper is cleared for the next batch. Undo
+      // restores BOTH the previous cues and the staged boxes.
+      pushUndo("narrate crops")
       setCues((prev) => [...(prev || []), ...newCues])
+      setRecapBoxes([])
+      // Register the narration language as the ORIGINAL (first time only) — this is
+      // what makes the header language dropdown + the "+" appear afterward.
+      if (!languages.some((l) => l.name === origLang)) onAddLanguage(origLang, "")
       notify({ severity: "success", message: `${crops.length} panel(s) narrated → ${crops.length} new cue(s)` })
     } catch (e) {
       notify({ severity: "error", message: e.message })
     } finally {
       setNarrating(false)
+    }
+  }
+
+  const openStoryMemory = async () => {
+    try {
+      setStoryMemory(await getStoryMemory(projectId))
+      setStoryMemoryOpen(true)
+    } catch (err) {
+      notify({ severity: "error", message: err.message })
+    }
+  }
+
+  const installMagiModel = async () => {
+    setInstallingMagi(true)
+    try {
+      const status = await installMagi()
+      setMagi(status)
+      setUseMagi(!!status?.installed)
+      notify({ severity: "success", message: "Magi v3 is installed. Visual grounding will be used for this recap." })
+    } catch (err) {
+      notify({ severity: "error", message: err.message })
+    } finally {
+      setInstallingMagi(false)
     }
   }
   const [addLangOpen, setAddLangOpen] = useState(false)       // add-language modal
@@ -723,20 +887,41 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
         const picked = await window.pywebview.api.pick_file(["PDF (*.pdf)"])
         if (picked) path = picked
       } else {
-        const picked = window.prompt("Absolute path to the manga PDF:", pdfPath)
-        if (picked) path = picked.trim()
+        pdfInputRef.current?.click()
+        return
       }
     } catch (e) { notify({ severity: "error", message: e.message }); return }
     if (path) { setPdfPath(path); setRightView("panels") }
   }
-  const attachPanel = async (dataUrl) => {
+  const importSelectedPdf = async (e) => {
+    const file = e.target.files?.[0]
+    e.target.value = ""
+    if (!file) return
+    try {
+      const imported = await importPdf(file)
+      setPdfPath(imported.path)
+      setRightView("panels")
+      notify({ severity: "success", message: `Loaded ${imported.filename}` })
+    } catch (err) { notify({ severity: "error", message: err.message }) }
+  }
+  // Panels are stored on disk by a STABLE per-cue id, never the array index —
+  // deleting a cue shifts indexes, and index-keyed files let a later save
+  // silently overwrite a panel another cue still references (project "corruption").
+  // Legacy cues without a panelId keep resolving to their original index.
+  // eslint-disable-next-line react-hooks/purity -- called from event handlers only, never during render
+  const newPanelId = (offset = 0) => (Date.now() % 2_000_000_000) + offset
+
+  const attachPanel = async (dataUrl, box = null) => {
     const idx = cropIdx
     if (idx < 0 || idx >= cues.length || !dataUrl) return false
     setCropping(true)
     try {
-      const res = await savePanel(projectId, idx, dataUrl)
+      pushUndo("attach panel")
+      const pid = cues[idx].panelId != null ? cues[idx].panelId : newPanelId()
+      const res = await savePanel(projectId, pid, dataUrl)
+      // eslint-disable-next-line react-hooks/purity -- event handler, not render (cache-bust query)
       const v = `?v=${Date.now()}`
-      setCues((prev) => prev.map((c, i) => i === idx ? { ...c, image: (res.image || "") + v, raw: res.raw || "" } : c))
+      setCues((prev) => prev.map((c, i) => i === idx ? { ...c, panelId: pid, image: (res.image || "") + v, raw: res.raw || "", panelBox: box || c.panelBox || null } : c))
       notify({ severity: "success", message: `Cue ${idx + 1}: panel attached` })
       for (let j = idx + 1; j < cues.length; j++) { if (!cues[j].image) { setCropIdx(j); break } }
       return true
@@ -744,8 +929,22 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
     finally { setCropping(false) }
   }
   const removePanel = (idx) => {
-    deletePanel(projectId, idx).catch(() => {})
-    setCues((prev) => prev.map((c, i) => i === idx ? { ...c, image: null, raw: null } : c))
+    pushUndo("remove panel")
+    // DETACH only — the file stays on disk so Undo can restore the cue's image.
+    // Orphaned files are cheap; deleting here made undone cues point at nothing.
+    setCues((prev) => prev.map((c, i) => i === idx ? { ...c, image: null, raw: null, panelBox: null } : c))
+  }
+
+  // ── Per-cue panel editor: a cue's thumbnail opens ITS OWN crop, alone ──────
+  const [editPanelIdx, setEditPanelIdx] = useState(null)   // cue index | null
+  const saveEditedPanel = async (idx, dataUrl, box) => {
+    pushUndo("edit panel")
+    const pid = cues[idx].panelId != null ? cues[idx].panelId : newPanelId()
+    const res = await savePanel(projectId, pid, dataUrl)
+    // eslint-disable-next-line react-hooks/purity -- event handler, not render (cache-bust query)
+    const v = `?v=${Date.now()}`
+    setCues((prev) => prev.map((c, i) => i === idx ? { ...c, panelId: pid, image: (res.image || "") + v, raw: res.raw || "", panelBox: box || null } : c))
+    notify({ severity: "success", message: `Cue ${idx + 1}: panel updated` })
   }
   const runUpscaleAll = async () => {
     try {
@@ -783,11 +982,23 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
 
   // Per-cue ✦AI refine (re-translate shorter to cut CPS) — set of busy indices
   const [refining, setRefining] = useState(() => new Set())
+  // Multi-cue selection for BATCH actions (batch ✦AI Fix). Holds cue indices.
+  const [selectedCues, setSelectedCues] = useState(() => new Set())
+  const toggleSelect = useCallback((i) => {
+    setSelectedCues((s) => { const n = new Set(s); n.has(i) ? n.delete(i) : n.add(i); return n })
+  }, [])
+  const clearSelection = useCallback(() => setSelectedCues(new Set()), [])
 
-  // Undo / redo of translation edits
-  const [undoStack, setUndoStack] = useState([])
+  // ── Unified undo / redo ────────────────────────────────────────────────────
+  // ONE chronological history for EVERY edit in the project: cue text edits,
+  // cue delete/merge/insert, AI refine, narration, panel attach/remove/re-crop,
+  // and crop-box create/move/resize/delete. Each entry is an atomic snapshot of
+  // { cues, boxes } so undo/redo can never desync translations from crops
+  // (the old cues-only stack undid translations while crop boxes stayed put).
+  const [undoStack, setUndoStack] = useState([])   // [{ cues, boxes, label }]
   const [redoStack, setRedoStack] = useState([])
   const editSnapshot = useRef(null)
+  const HISTORY_MAX = 80
 
   const videoRef = useRef(null)
   const audioRef = useRef(null)
@@ -810,8 +1021,16 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
   //   Panels  → nothing plays.
   // Voiceover (refineMode=false) keeps the classic coupled behavior: the video
   // is the clock and the dub audio rides along, mixed by the two sliders.
+  // In Panels (cropping) view there's no video, but the dub audio stays mounted
+  // — so if a dub exists, let it be the driver there too. That's what restores
+  // Space / Play to control timeline audio while you crop.
+  // Does the ACTIVE language have a generated dub? Drives the timeline (cleared
+  // when false) and what Space/Play can control.
+  const hasDubForSelected = refineMode ? !!dubUrls[selectedLang] : !!ttsAudioUrl
   const driver = refineMode
-    ? (rightView === "preview" ? "audio" : rightView === "source" ? "video" : "none")
+    ? (rightView === "preview" ? "audio"
+       : rightView === "source" ? "video"
+       : (ttsAudioUrl ? "audio" : "none"))
     : "video"
   const [audioDuration, setAudioDuration] = useState(0)
 
@@ -832,7 +1051,11 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
   // Pages are kept mounted (display:none) to preserve state, but CSS hiding
   // does NOT stop <video>/<audio> playback — we must do it explicitly.
   const { state: appState } = useApp()
-  const ownerPage = refineMode ? PAGES.VIDEO_REFINE : (recapMode ? PAGES.RECAP : PAGES.VOICEOVER)
+  // A recap project has BOTH refineMode and recapMode true and lives on the RECAP
+  // page — so recapMode MUST win here. Getting this wrong made isActivePageRef
+  // always false (Space did nothing) and the pause-effect mute playback on the
+  // recap page (it thought we were off-page).
+  const ownerPage = recapMode ? PAGES.RECAP : (refineMode ? PAGES.VIDEO_REFINE : PAGES.VOICEOVER)
   useEffect(() => {
     if (appState.page !== ownerPage) {
       videoRef.current?.pause()
@@ -1025,7 +1248,14 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
 
   /* ── Cue editing + undo/redo ──────────────────────────────────────────── */
 
-  const pushUndo = () => { setUndoStack((s) => [...s, cues]); setRedoStack([]) }
+  // Snapshot the CURRENT project edit state as one atomic history entry.
+  const snapshot = (label = "") => ({ cues, boxes: recapBoxes, label })
+  const pushEntry = (entry) => {
+    setUndoStack((s) => [...s.slice(-(HISTORY_MAX - 1)), entry])
+    setRedoStack([])
+  }
+  const pushUndo = (label = "") => pushEntry(snapshot(label))
+  const restore = (entry) => { setCues(entry.cues); setRecapBoxes(entry.boxes || []) }
 
   const updateCue = (idx, newTranslated) => {
     setCues((prev) => {
@@ -1073,14 +1303,14 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
   const join = (arr) => arr.filter(Boolean).join(" ").replace(/\s+/g, " ").trim()
 
   const deleteCue = (idx) => {
-    pushUndo()
+    pushUndo("delete cue")
     setCues((prev) => prev.filter((_, i) => i !== idx))
   }
 
   // Merge cue idx with the one AFTER it (the between-cue merge control).
   const mergeAdjacent = (idx) => {
     if (idx < 0 || idx + 1 >= cues.length) return
-    pushUndo()
+    pushUndo("merge cues")
     setCues((prev) => {
       const a = prev[idx], b = prev[idx + 1]
       const translations = {}
@@ -1101,7 +1331,7 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
 
   // Insert a fresh empty cue AFTER idx, timed into the gap to the next cue.
   const insertCueAfter = (idx) => {
-    pushUndo()
+    pushUndo("insert cue")
     setCues((prev) => {
       const a = prev[idx]
       const next = prev[idx + 1]
@@ -1121,7 +1351,7 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
     const c = cues[idx]
     if (!c || refining.has(idx)) return
     setRefining((s) => new Set(s).add(idx))
-    const before = cues
+    const before = snapshot("AI fix cue")
     try {
       const res = await refineCue({
         text: c.text, translated: c.translated,
@@ -1133,8 +1363,7 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
       if (res?.changed === false) {
         notify({ severity: "info", message: `Cue ${idx + 1} already fits (${res.cps} CPS) — no change.` })
       } else if (res?.translated) {
-        setUndoStack((s) => [...s, before])   // make the AI edit undoable
-        setRedoStack([])
+        pushEntry(before)   // make the AI edit undoable
         const next = cues.map((x, i) => (i === idx ? {
           ...x,
           text: selectedLang === sourceLang ? res.translated : x.text,
@@ -1156,41 +1385,103 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
     }
   }
 
-  const beginEdit = () => { editSnapshot.current = cues }
+  // Batch ✦AI Fix: re-translate every selected cue shorter, then re-voice all the
+  // ones that actually changed in a SINGLE reassembly (one master pass) — instead
+  // of the one-by-one loop that redubs (and masters) per cue.
+  const refineManySelected = async () => {
+    const list = [...selectedCues].filter((i) => cues[i] && !refining.has(i)).sort((a, b) => a - b)
+    if (!list.length) return
+    setRefining((s) => { const n = new Set(s); list.forEach((i) => n.add(i)); return n })
+    const before = snapshot("AI fix cues")
+    try {
+      let working = cues
+      const changed = []
+      for (const idx of list) {
+        const c = working[idx]
+        try {
+          const res = await refineCue({
+            text: c.text, translated: c.translated,
+            start: c.start, end: (c.start ?? 0) + effDur(working, idx), langCode: targetLang,
+          })
+          if (res?.translated && res.changed !== false) {
+            working = working.map((x, i) => (i === idx ? {
+              ...x,
+              text: selectedLang === sourceLang ? res.translated : x.text,
+              translated: res.translated,
+              translations: { ...(x.translations || {}), [selectedLang]: res.translated },
+              staleLangs: (x.staleLangs || []).filter((n) => n !== selectedLang),
+              cps: res.cps, rushed: res.rushed,
+            } : x))
+            changed.push(idx)
+          }
+        } catch { /* skip this cue, keep going */ }
+      }
+      if (changed.length) {
+        pushEntry(before)            // one undo entry for the whole batch
+        setCues(working)
+        notify({ severity: "success", message: `Refined ${changed.length}/${list.length} cue(s)` })
+        if (hasDubForSelected && redubMany) await redubMany(changed, working)
+      } else {
+        notify({ severity: "info", message: "All selected cues already fit — no change." })
+      }
+      clearSelection()
+    } catch (err) {
+      notify({ severity: "error", message: err.message })
+    } finally {
+      setRefining((s) => { const n = new Set(s); list.forEach((i) => n.delete(i)); return n })
+    }
+  }
+
+  const beginEdit = () => { editSnapshot.current = snapshot("edit text") }
   const commitEdit = () => {
-    if (editSnapshot.current && JSON.stringify(editSnapshot.current) !== JSON.stringify(cues)) {
-      setUndoStack((s) => [...s, editSnapshot.current])
-      setRedoStack([])
+    if (editSnapshot.current && JSON.stringify(editSnapshot.current.cues) !== JSON.stringify(cues)) {
+      pushEntry(editSnapshot.current)
     }
     editSnapshot.current = null
   }
 
+  // The per-language audio identity of a cue list — if this differs between the
+  // current state and the one we're restoring, the actual audio must be rebuilt.
+  const audioSig = (arr, lang) => (arr || []).map((c) => c.audioKeys?.[lang] || "").join("|")
+
   const undo = () => {
-    setUndoStack((s) => {
-      if (!s.length) return s
-      const prev = s[s.length - 1]
-      setRedoStack((r) => [...r, cues])
-      setCues(prev)
-      return s.slice(0, -1)
-    })
+    if (!undoStack.length) return
+    const prev = undoStack[undoStack.length - 1]
+    const needAudio = audioSig(cues, targetLang) !== audioSig(prev.cues, targetLang)
+    setRedoStack((r) => [...r, snapshot()])
+    setUndoStack((s) => s.slice(0, -1))
+    restore(prev)
+    if (needAudio) restoreAudioTo(prev.cues)   // rebuild the track from the old clip versions
   }
   const redo = () => {
-    setRedoStack((r) => {
-      if (!r.length) return r
-      const next = r[r.length - 1]
-      setUndoStack((s) => [...s, cues])
-      setCues(next)
-      return r.slice(0, -1)
-    })
+    if (!redoStack.length) return
+    const next = redoStack[redoStack.length - 1]
+    const needAudio = audioSig(cues, targetLang) !== audioSig(next.cues, targetLang)
+    setUndoStack((s) => [...s, snapshot()])
+    setRedoStack((r) => r.slice(0, -1))
+    restore(next)
+    if (needAudio) restoreAudioTo(next.cues)
   }
 
-  const toggleReviewed = (idx) => {
-    setReviewed((prev) => (prev.includes(idx) ? prev.filter((i) => i !== idx) : [...prev, idx]))
-  }
-  const checkAll = () => {
-    setReviewed((prev) => (prev.length === cues.length ? [] : cues.map((_, i) => i)))
-  }
-  const reviewedPct = cues.length ? Math.round((reviewed.length / cues.length) * 100) : 0
+  // ⌘Z / ⌃Z undo · ⇧⌘Z / ⌃Y redo — skipped while typing (the field's own
+  // native undo applies there; our history captures the edit on blur).
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!(e.metaKey || e.ctrlKey)) return
+      const k = e.key.toLowerCase()
+      if (k !== "z" && k !== "y") return
+      const t = e.target
+      if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.isContentEditable)) return
+      if (!isActivePageRef.current) return
+      e.preventDefault()
+      if (k === "y" || (k === "z" && e.shiftKey)) redo()
+      else undo()
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cues, recapBoxes, undoStack, redoStack])
+
 
   /* ── AI Refine (rewrite the whole narration) ──────────────────────────── */
 
@@ -1205,8 +1496,7 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
         { durations: cues.map((c, i) => effDur(cues, i)), level: "standard", instructions, lang: targetLang },
       )
       const lines = res?.lines || []
-      setUndoStack((s) => [...s, cues])    // whole-script refine is one undo step
-      setRedoStack([])
+      pushUndo("AI refine script")    // whole-script refine is one undo step
       setCues((prev) => prev.map((c, i, arr) => {
         const t = lines[i] ?? c.translated ?? c.text
         const dur = effDur(arr, i)
@@ -1276,6 +1566,7 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", width: "100%", background: colors.bg, color: colors.text, overflow: "hidden", fontFamily: fonts.ui }}>
+      <input ref={pdfInputRef} type="file" accept="application/pdf,.pdf" onChange={importSelectedPdf} style={{ display: "none" }} />
 
       {/* Global top bar */}
       <TopBar onExport={doExport} exporting={exporting} canExport={!!ttsAudioUrl} onBack={onBack}
@@ -1294,27 +1585,62 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
           <div onClick={(e) => e.stopPropagation()} style={{ width: 600, maxHeight: "88vh", overflowY: "auto", background: colors.panel, border: `1px solid ${colors.border}`, borderRadius: radius.lg, padding: 24 }}>
             <h2 style={{ color: colors.text, fontSize: fonts.xl, fontWeight: fonts.bold, marginBottom: 6 }}>Narrate {pendingCrops.length} panel{pendingCrops.length === 1 ? "" : "s"}</h2>
             <p style={{ color: colors.muted, fontSize: fonts.sm, marginBottom: 14 }}>
-              A two-step storyteller: vision reads each panel, then a reasoning model resolves who's who (using the cast + memory below) and narrates. The character registry & story carry forward across batches — so names, relationships and appearance changes stay consistent.
+              A whole-chapter storyteller: vision reads every panel, then a reasoning model reads the ENTIRE chapter first to resolve who's who with hindsight. Story Memory carries forward only confirmed, evidence-backed identities, appearances, and events, so continuity improves without bloating the prompt.
             </p>
+
+            {/* Narration language: chosen here on the FIRST narration — it becomes
+                the project's original language. Locked to it for later chapters. */}
+            <label style={{ display: "block", color: colors.textDim, fontSize: fonts.sm, marginBottom: 6 }}>Narrate in <span style={{ color: colors.muted }}>(this becomes the original language)</span></label>
+            {sourceLang ? (
+              <div style={{ background: colors.panel2, border: `1px solid ${colors.border}`, color: colors.text, padding: "9px 12px", borderRadius: radius.md, marginBottom: 14, fontWeight: fonts.medium }}>
+                {sourceLang} <span style={{ color: colors.muted, fontWeight: fonts.normal }}>· original (fixed for this recap)</span>
+              </div>
+            ) : (
+              <select value={narrateLang || (langOptions[0]?.name || "")} onChange={(e) => setNarrateLang(e.target.value)}
+                style={{ width: "100%", background: colors.panel2, border: `1px solid ${colors.border}`, color: colors.text, padding: "9px 12px", borderRadius: radius.md, marginBottom: 14 }}>
+                {langOptions.length === 0 && <option value="">Loading languages…</option>}
+                {langOptions.map((l) => <option key={l.name} value={l.name}>{l.name}</option>)}
+              </select>
+            )}
 
             <label style={{ display: "block", color: colors.textDim, fontSize: fonts.sm, marginBottom: 6 }}>Cast list <span style={{ color: colors.muted }}>(optional but recommended — anchors identities)</span></label>
             <textarea value={castSeed} onChange={(e) => setCastSeed(e.target.value)} rows={3}
-              placeholder={"Sung Jin-Woo — black hair, hunter; later muscular Shadow Monarch\nCha Hae-In — blonde, S-rank, ally of Jin-Woo"}
+              placeholder={"Main character — black hair, swordsman; later muscular armored form\nRival — blonde, ally of the main character"}
               style={{ width: "100%", background: colors.panel2, border: `1px solid ${colors.border}`, color: colors.text, padding: "9px 12px", borderRadius: radius.md, marginBottom: 14, fontFamily: fonts.ui, resize: "vertical" }} />
 
             <label style={{ display: "block", color: colors.textDim, fontSize: fonts.sm, marginBottom: 6 }}>Narration style / instructions</label>
             <textarea value={narrPrompt} onChange={(e) => setNarrPrompt(e.target.value)} rows={3}
               style={{ width: "100%", background: colors.panel2, border: `1px solid ${colors.border}`, color: colors.text, padding: "9px 12px", borderRadius: radius.md, marginBottom: 12, fontFamily: fonts.ui, resize: "vertical" }} />
 
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 16 }}>
               <label style={{ display: "flex", alignItems: "center", gap: 8, color: colors.textDim, fontSize: fonts.sm, cursor: "pointer" }}>
                 <input type="checkbox" checked={resetMemory} onChange={(e) => setResetMemory(e.target.checked)} style={{ accentColor: colors.accent }} />
-                Start a new chapter (reset story memory — keeps the character registry)
+                Start a new chapter (reset the running summary, keep confirmed Story Memory)
               </label>
-              <button onClick={() => { setPendingCrops(null); setRegistryOpen(true) }}
-                style={{ color: colors.accent, fontSize: fonts.sm, background: "none", border: "none", cursor: "pointer" }}>
-                👥 {registry.characters?.length || 0} character(s) — edit registry
-              </button>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <button onClick={openStoryMemory}
+                  style={{ color: colors.info, fontSize: fonts.sm, background: "none", border: "none", cursor: "pointer" }}>
+                  ⬡ Review Story Memory
+                </button>
+              </div>
+            </div>
+
+            <div style={{ background: colors.panel2, border: `1px solid ${colors.border}`, borderRadius: radius.md, padding: "10px 12px", marginBottom: 16 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, color: colors.text, fontSize: fonts.sm, cursor: magi.installed ? "pointer" : "default" }}>
+                  <input type="checkbox" checked={useMagi} disabled={!magi.installed || installingMagi}
+                    onChange={(event) => setUseMagi(event.target.checked)} style={{ accentColor: colors.accent }} />
+                  <span><strong>Magi v3 visual grounding</strong> <span style={{ color: colors.muted }}>character boxes, OCR, and speech links</span></span>
+                </label>
+                {!magi.installed && <Button variant="secondary" disabled={installingMagi} onClick={installMagiModel} style={{ padding: "6px 10px" }}>
+                  {installingMagi ? "Installing Magi…" : "Install Magi v3"}
+                </Button>}
+              </div>
+              <div style={{ color: colors.muted, fontSize: fonts.xs, marginTop: 6 }}>
+                {magi.installed
+                  ? `Installed locally${magi.device ? ` · active on ${magi.device}` : " · loads on first recap"}. Its visual evidence is reviewed through Story Memory.`
+                  : "Optional local model. Its official checkpoint is downloaded only if you choose Install. It is licensed for personal, research, non-commercial and not-for-profit use."}
+              </div>
             </div>
 
             <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
@@ -1324,20 +1650,39 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
           </div>
         </div>
       )}
-      {registryOpen && (
-        <CharacterRegistryModal
-          registry={registry} setRegistry={setRegistry}
-          onClose={() => setRegistryOpen(false)}
-          onSave={(reg) => { setRegistry(reg); saveRecapState(projectId, { registry: reg }).catch(() => {}); setRegistryOpen(false) }} />
+      {storyMemoryOpen && (
+        <StoryMemoryModal
+          memory={storyMemory}
+          onClose={() => setStoryMemoryOpen(false)}
+          onSaveCharacter={async (stableId, changes) => {
+            const result = await updateStoryCharacter(projectId, stableId, changes)
+            setStoryMemory(result.memory)
+            return result.memory
+          }}
+          onDeleteCharacter={async (stableId) => { const memory = await deleteStoryCharacter(projectId, stableId); setStoryMemory(memory); return memory }}
+          onUndo={async () => { const memory = await undoStoryMemory(projectId); setStoryMemory(memory); return memory }}
+          onRedo={async () => { const memory = await redoStoryMemory(projectId); setStoryMemory(memory); return memory }}
+        />
+      )}
+      {editPanelIdx != null && cues[editPanelIdx] && (
+        <PanelEditorModal
+          idx={editPanelIdx}
+          cue={cues[editPanelIdx]}
+          pdfUrl={pdfPath ? mediaSrc(pdfPath) : ""}
+          onOpenPdf={openPdf}
+          onSave={async (data, box) => { await saveEditedPanel(editPanelIdx, data, box); setEditPanelIdx(null) }}
+          onRemove={() => { removePanel(editPanelIdx); setEditPanelIdx(null) }}
+          onClose={() => setEditPanelIdx(null)}
+        />
       )}
       {speakerModalOpen && (
         <SpeakerModal
           speakersMap={speakersMap}
           setSpeakersMap={setSpeakersMap}
           voices={voices}
-          defaultVoice={voice}
+          defaultVoice={voice || voiceForLang(voices, selectedLang)}
           onClose={() => setSpeakerModalOpen(false)}
-          onAddSpeaker={(newSpeaker) => setSpeakersMap(prev => ({ ...prev, [newSpeaker]: "" }))}
+          onAddSpeaker={(newSpeaker) => setSpeakersMap(prev => ({ ...prev, [newSpeaker]: prev[newSpeaker] || voiceForLang(voices, selectedLang) }))}
         />
       )}
       {mergeModalTarget && (
@@ -1362,22 +1707,33 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
           {/* Left header */}
           <div style={{ height: 56, borderBottom: `1px solid ${colors.border}`, display: "flex", alignItems: "center", padding: "0 16px", justifyContent: "space-between", background: colors.panel, flexShrink: 0 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, background: colors.panel2, border: `1px solid ${colors.border}`, borderRadius: radius.md, padding: "6px 10px" }}>
-                <span style={{ fontSize: 16 }}>🏳️</span>
-                {refineMode ? (
-                  <select value={selectedLang} onChange={(e) => onSwitchLang(e.target.value)}
-                    style={{ background: "transparent", color: colors.text, border: "none", fontWeight: fonts.bold, outline: "none" }}>
-                    {languages.length === 0 && <option value="">No language</option>}
-                    {languages.map((l) => <option key={l.name} value={l.name}>{l.name}{l.name === sourceLang ? " (Original)" : ""}</option>)}
-                  </select>
-                ) : (
-                  <span style={{ fontWeight: fonts.bold }}>{targetLang}</span>
-                )}
-              </div>
+              {/* Recap makes no language assumption: until the user adds one, only
+                  the + (add language) and Story Memory show. The language selector
+                  appears once at least one language exists. */}
               {refineMode ? (
-                <button onClick={() => setAddLangOpen(true)} title="Add a language + voice"
-                  disabled={selectedLang === sourceLang && !cues.some(c => c.translated)}
-                  style={{ width: 34, height: 34, borderRadius: radius.md, background: colors.panel2, border: `1px solid ${colors.border}`, color: colors.accent, fontSize: 18, fontWeight: fonts.bold, opacity: (selectedLang === sourceLang && !cues.some(c => c.translated)) ? 0.5 : 1 }}>+</button>
+                languages.length > 0 && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, background: colors.panel2, border: `1px solid ${colors.border}`, borderRadius: radius.md, padding: "6px 10px" }}>
+                    <span style={{ fontSize: 16 }}>🏳️</span>
+                    <select value={selectedLang} onChange={(e) => onSwitchLang(e.target.value)}
+                      style={{ background: "transparent", color: colors.text, border: "none", fontWeight: fonts.bold, outline: "none" }}>
+                      {languages.map((l) => <option key={l.name} value={l.name}>{l.name}{l.name === sourceLang ? " (Original)" : ""}</option>)}
+                    </select>
+                  </div>
+                )
+              ) : (
+                <div style={{ display: "flex", alignItems: "center", gap: 8, background: colors.panel2, border: `1px solid ${colors.border}`, borderRadius: radius.md, padding: "6px 10px" }}>
+                  <span style={{ fontSize: 16 }}>🏳️</span>
+                  <span style={{ fontWeight: fonts.bold }}>{targetLang}</span>
+                </div>
+              )}
+              {refineMode ? (
+                // The + adds a TRANSLATION language, and only appears once the
+                // original exists. The original itself is chosen in the Narrate
+                // window (below), so a fresh recap has no + and no language dropdown.
+                languages.length > 0 && (
+                  <button onClick={() => setAddLangOpen(true)} title="Add another language + voice"
+                    style={{ width: 34, height: 34, borderRadius: radius.md, background: colors.panel2, border: `1px solid ${colors.border}`, color: colors.accent, fontSize: 18, fontWeight: fonts.bold }}>+</button>
+                )
               ) : (
                 <select value={voice} onChange={(e) => setVoice(e.target.value)}
                   style={{ background: colors.panel2, color: colors.text, border: `1px solid ${colors.border}`, padding: "7px 10px", borderRadius: radius.md }}>
@@ -1387,32 +1743,44 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              {refineMode && selectedLang !== sourceLang && (
-                <Button variant="secondary" onClick={onTranslate} disabled={translating || !selectedLang} loading={translating}
-                  title={`Translate the ${sourceLang} cues to ${selectedLang || "the selected language"}`}>
-                  {translating ? "Translating…" : `🌐 Translate`}
-                </Button>
-              )}
               {recapMode && (
-                <Button variant="secondary" onClick={() => setRegistryOpen(true)}
-                  title="View / edit the character registry the narrator uses">
-                  👥 {registry.characters?.length || 0}
+                <Button variant="secondary" onClick={openStoryMemory}
+                  title="Review evidence-backed characters and events">
+                  ⬡ Story Memory
                 </Button>
               )}
-              <Button variant="primary" onClick={() => generateDub()}
-                disabled={busy || (refineMode && !selectedLang)
-                  || (refineMode && selectedLang === sourceLang && !cues.some(c => c.translated))
-                  || (refineMode && selectedLang !== sourceLang && !dubUrls[sourceLang])}
-                loading={busy}
-                title={refineMode && selectedLang === sourceLang && !cues.some(c => c.translated)
-                  ? "You must refine the original text before generating a dub"
-                  : refineMode && selectedLang !== sourceLang && !dubUrls[sourceLang]
-                    ? `Generate the ${sourceLang} (original) dub first — it defines the timeline every translation fits into`
-                    : "Generate the voiceover: text-to-speech + sync to the timeline"}
-                style={{ background: colors.accent, color: "#000", fontWeight: fonts.bold, border: "none", borderRadius: radius.full, padding: "8px 18px" }}>
-                {busy ? statusMsg || "Working…"
-                  : `✨ ${ttsAudioUrl ? "Regenerate" : "Generate"}${refineMode && selectedLang ? ` ${selectedLang}` : ""} Dub`}
-              </Button>
+              {(() => {
+                const isTranslation = refineMode && selectedLang !== sourceLang
+                const hasTranslation = cues.some((c) => (c.translations?.[selectedLang] || "").trim())
+                // A translation must be translated before it can be dubbed. Show ONLY
+                // Translate until then; afterward the button becomes Generate Dub.
+                if (isTranslation && !hasTranslation) {
+                  return (
+                    <Button variant="primary" onClick={onTranslate} disabled={translating || !selectedLang || !dubUrls[sourceLang]} loading={translating}
+                      title={!dubUrls[sourceLang] ? `Generate the ${sourceLang} (original) dub first` : `Translate the ${sourceLang} cues to ${selectedLang}`}
+                      style={{ background: colors.accent, color: "#000", fontWeight: fonts.bold, border: "none", borderRadius: radius.full, padding: "8px 18px" }}>
+                      {translating ? "Translating…" : `🌐 Translate to ${selectedLang}`}
+                    </Button>
+                  )
+                }
+                // Generate Dub — only once there's a language + narrated cues.
+                if (refineMode && (!selectedLang || cues.length === 0)) return null
+                const noOriginalText = refineMode && selectedLang === sourceLang && !cues.some((c) => c.translated)
+                const needsSourceDub = isTranslation && !dubUrls[sourceLang]
+                const noVoice = refineMode && voices.length === 0   // generate falls back to any voice, so only truly blocked when NONE exist
+                const disabled = busy || (refineMode && !selectedLang) || noOriginalText || needsSourceDub || noVoice
+                const title = noVoice ? "Create a voice profile first (Voices section)"
+                  : noOriginalText ? "Refine the original text before generating a dub"
+                  : needsSourceDub ? `Generate the ${sourceLang} (original) dub first — it defines the timeline every translation fits into`
+                  : "Generate the voiceover: text-to-speech + sync to the timeline"
+                return (
+                  <Button variant="primary" onClick={() => generateDub()} disabled={disabled} loading={busy} title={title}
+                    style={{ background: colors.accent, color: "#000", fontWeight: fonts.bold, border: "none", borderRadius: radius.full, padding: "8px 18px" }}>
+                    {busy ? statusMsg || "Working…"
+                      : `✨ ${ttsAudioUrl ? "Regenerate" : "Generate"}${refineMode && selectedLang ? ` ${selectedLang}` : ""} Dub`}
+                  </Button>
+                )
+              })()}
             </div>
           </div>
 
@@ -1427,6 +1795,32 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
             <div style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, padding: "8px 16px", background: "rgba(251,191,36,0.10)", borderBottom: `1px solid rgba(251,191,36,0.35)`, color: colors.warning, fontSize: fonts.sm }}>
               <span>⚠</span>
               <span>The {sourceLang} timing changed — <b>{staleTimingLangs.join(", ")}</b> {staleTimingLangs.length > 1 ? "were" : "was"} fit to the old timeline. Re-translate + regenerate {staleTimingLangs.length > 1 ? "their dubs" : "its dub"} when ready.</span>
+            </div>
+          )}
+
+          {/* Batch action bar — appears once one or more cues are checked. */}
+          {selectedCues.size > 0 && (
+            <div style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 12, padding: "8px 16px",
+              background: "rgba(251,191,36,0.10)", borderBottom: `1px solid rgba(251,191,36,0.35)`, color: colors.text, fontSize: fonts.sm }}>
+              <span style={{ fontWeight: fonts.bold }}>{selectedCues.size} selected</span>
+              <div style={{ flex: 1 }} />
+              {!(refineMode && selectedLang === sourceLang) && (
+                <button onClick={refineManySelected} disabled={refining.size > 0 || busy}
+                  title="AI: re-translate every selected line shorter, then re-voice them in one pass"
+                  style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: fonts.bold,
+                    color: refining.size > 0 ? colors.muted : colors.warning,
+                    border: `1px solid ${refining.size > 0 ? colors.border : "rgba(251,191,36,0.5)"}`,
+                    background: refining.size > 0 ? colors.panel2 : "rgba(251,191,36,0.14)",
+                    borderRadius: radius.full, padding: "4px 12px", cursor: refining.size > 0 ? "wait" : "pointer" }}>
+                  {refining.size > 0
+                    ? <><span style={{ width: 10, height: 10, border: "1.5px solid currentColor", borderTopColor: "transparent", borderRadius: "50%", display: "inline-block", animation: "ms-spin 0.65s linear infinite" }} /> Fixing {refining.size}…</>
+                    : `✦ AI Fix ${selectedCues.size} selected`}
+                </button>
+              )}
+              <button onClick={clearSelection} disabled={refining.size > 0}
+                style={{ color: colors.textDim, fontSize: 12, fontWeight: fonts.bold, padding: "4px 8px" }}>
+                Clear
+              </button>
             </div>
           )}
 
@@ -1449,12 +1843,13 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
                 index={i}
                 cue={c}
                 active={i === activeIdx}
-                reviewed={reviewed.includes(i)}
+                selected={selectedCues.has(i)}
+                onToggleSelect={() => toggleSelect(i)}
                 refining={refining.has(i)}
-                dirty={!!ttsAudioUrl && c.dubbed !== undefined && (c.translated !== c.dubbed || (c.dubbedVoice !== undefined && (speakersMap[c.speaker] || voice) !== c.dubbedVoice))}
+                defaultVoice={voice || voiceForLang(voices, selectedLang)}
+                dirty={!!ttsAudioUrl && c.dubbed !== undefined && (c.translated !== c.dubbed || (c.dubbedVoice !== undefined && (speakersMap[c.speaker] || voice || voiceForLang(voices, targetLang)) !== c.dubbedVoice))}
                 redubbing={redubbing?.has(i)}
                 hideOriginal={hideOriginal}
-                onToggleReviewed={() => toggleReviewed(i)}
                 onPlay={() => playCue(c)}
                 onRefine={() => refine(i)}
                 onRedub={() => redubOne(i)}
@@ -1469,10 +1864,14 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
                 onOpenSpeakerModal={() => setSpeakerModalOpen(true)}
                 onAddSpeaker={() => {
                   const maxIdx = Math.max(0, ...cues.map(c => parseInt((c.speaker||"").replace("Speaker ", "") || 0)))
-                  setCues(prev => prev.map((c, idx) => idx === i ? { ...c, speaker: `Speaker ${maxIdx + 1}` } : c))
+                  const ns = `Speaker ${maxIdx + 1}`
+                  // Default a new speaker to a voice of the current language.
+                  setSpeakersMap(prev => ({ ...prev, [ns]: prev[ns] || voiceForLang(voices, selectedLang) }))
+                  setCues(prev => prev.map((c, idx) => idx === i ? { ...c, speaker: ns } : c))
                 }}
                 onDeleteSpeaker={(s) => setMergeModalTarget(s)}
                 onRemovePanel={() => removePanel(i)}
+                onEditPanel={refineMode && pdfPath ? () => setEditPanelIdx(i) : null}
                 onOriginalChange={(t) => updateOriginal(i, t)}
                 stale={refineMode && selectedLang !== sourceLang && (c.staleLangs || []).includes(selectedLang)}
                 sourceLang={sourceLang}
@@ -1534,8 +1933,6 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
               ) : (
                 <>
                   <span style={{ color: colors.textDim }}>{formatTime(totalTime)}</span>
-                  <span style={{ color: reviewedPct === 100 ? colors.success : colors.textDim }}>Reviewed {reviewedPct}%</span>
-                  <button onClick={checkAll} style={{ color: colors.accent, fontSize: fonts.sm }}>Check All</button>
                 </>
               )}
             </div>
@@ -1549,6 +1946,7 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
                 multi={recapMode} narrating={narrating}
                 boxesValue={recapMode ? recapBoxes : null}
                 onBoxesChange={recapMode ? setRecapBoxes : null}
+                onBeforeChange={recapMode ? pushUndo : null}
                 onNarrate={(crops, status) => {
                   if (status === "loading") { notify({ severity: "error", message: "The PDF is still loading — wait a second, then hit Narrate again." }); return }
                   if (status === "empty") { notify({ severity: "info", message: "Draw at least one crop box first." }); return }
@@ -1647,11 +2045,16 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
           <Splitter axis="y" onPointerDown={onRowDown} />
           <Timeline
             ref={timelineScrollRef}
-            cues={cues}
+            // A cue's start/end is the DUB timeline. A language with no dub has no
+            // real timeline — showing the source dub's timing there is misleading,
+            // so the strip is cleared until this language is actually dubbed.
+            cues={hasDubForSelected ? cues : []}
+            noDubLang={hasDubForSelected ? "" : selectedLang}
+            dubLang={selectedLang}
             height={timelineH}
             pxPerSec={pxPerSec}
             setPxPerSec={setPxPerSec}
-            totalTime={totalTime}
+            totalTime={hasDubForSelected ? totalTime : 0}
             currentTime={currentTime}
             activeIdx={activeIdx}
             onSeek={seek}
@@ -1755,6 +2158,69 @@ function RefineModal({ busy, targetLang, onClose, onGenerate }) {
    Add-language modal (Video Refine): pick a language, then a voice for it
 ───────────────────────────────────────────────────────────────────────────── */
 
+// Plays a voice profile's stored reference clip so you can hear it before
+// choosing. Toggles play/stop; falls back to a disabled tooltip if the voice
+// has no reference audio (the backend returns 404 → onerror).
+// Preview a voice by replaying the LAST test sample you generated in the Voices
+// section (saved per voice at tts_samples/<voice>.wav). If none exists yet, it
+// generates one on the fly (which also saves it for next time). Never plays the
+// raw reference clip the voice was cloned from.
+function VoicePreviewButton({ voiceName, language, disabled }) {
+  const [state, setState] = useState("idle")   // idle | loading | playing
+  const audioRef = useRef(null)
+
+  useEffect(() => {
+    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null }
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset on prop change
+    setState("idle")
+  }, [voiceName])
+
+  const stableName = (voiceName || "").replace(/[/\\]/g, "_")
+  const storedSampleUrl = () => `http://127.0.0.1:8000/files/tts_samples/${encodeURIComponent(stableName)}.wav?t=${Date.now()}`
+
+  const playUrl = (url, onFail) => {
+    const a = new Audio(url)
+    audioRef.current = a
+    a.onended = () => { setState("idle"); audioRef.current = null }
+    a.onerror = () => { audioRef.current = null; if (onFail) onFail(); else setState("idle") }
+    a.play().then(() => setState("playing")).catch(() => { audioRef.current = null; if (onFail) onFail(); else setState("idle") })
+  }
+
+  const generate = async () => {
+    setState("loading")
+    try {
+      let cur = await quickTTS("Hello — this is a quick preview of this voice.", voiceName, language)
+      while (cur && cur.status === "running") {
+        await new Promise((r) => setTimeout(r, 1000))
+        cur = await quickTTSStatus(cur.job_id)
+      }
+      if (!cur || cur.status === "failed") { setState("idle"); return }
+      const b = (cur.synced_audio_url || cur.audio_url || "").split("?")[0]
+      if (!b) { setState("idle"); return }
+      playUrl(`http://127.0.0.1:8000${b}?v=${Date.now()}`)
+    } catch { setState("idle") }
+  }
+
+  const toggle = () => {
+    if (!voiceName || state === "loading") return
+    if (state === "playing" && audioRef.current) { audioRef.current.pause(); audioRef.current = null; setState("idle"); return }
+    // Replay the stored test sample; only generate if there isn't one yet.
+    playUrl(storedSampleUrl(), generate)
+  }
+
+  return (
+    <button type="button" onClick={toggle} disabled={disabled || state === "loading"}
+      title={state === "loading" ? "Generating a sample…" : state === "playing" ? "Stop preview" : "Preview this voice (plays your Voices test sample)"}
+      style={{ width: 38, height: 38, flexShrink: 0, borderRadius: radius.md,
+        background: state === "playing" ? colors.accent : colors.panel2, color: state === "playing" ? "#000" : colors.text,
+        border: `1px solid ${colors.border}`, cursor: (disabled || state === "loading") ? "default" : "pointer", fontSize: 15 }}>
+      {state === "loading"
+        ? <span style={{ width: 12, height: 12, border: "2px solid currentColor", borderTopColor: "transparent", borderRadius: "50%", display: "inline-block", animation: "ms-spin 0.7s linear infinite" }} />
+        : state === "playing" ? "■" : "▶"}
+    </button>
+  )
+}
+
 function AddLanguageModal({ voices, existing, onClose, onAdd }) {
   const { notify } = useNotify()
   const [langs, setLangs] = useState([])      // [{code,name,engine}]
@@ -1768,9 +2234,9 @@ function AddLanguageModal({ voices, existing, onClose, onAdd }) {
     }).catch((e) => notify({ severity: "error", message: e.message }))
   }, [])
 
-  // Voices whose language matches the picked language (fall back to all if none).
-  const matches = voices.filter((v) => (v.language || "").toLowerCase() === lang.toLowerCase())
-  const voiceList = matches.length ? matches : voices
+  // Only voices tagged for the picked language — empty if none (no cross-language
+  // profiles, which caused wrong picks like a French voice under Chinese).
+  const voiceList = voices.filter((v) => (v.language || "").toLowerCase() === lang.toLowerCase())
   // Derived: if the chosen voice isn't valid for this language, default to the first.
   const effVoice = voiceList.some((v) => v.name === voice) ? voice : (voiceList[0]?.name || "")
 
@@ -1793,16 +2259,21 @@ function AddLanguageModal({ voices, existing, onClose, onAdd }) {
         </select>
 
         <label style={{ display: "block", color: colors.textDim, fontSize: fonts.sm, marginBottom: 6 }}>Voice profile</label>
-        <select value={effVoice} onChange={(e) => setVoice(e.target.value)}
-          style={{ width: "100%", background: colors.panel2, border: `1px solid ${colors.border}`, color: colors.text, padding: "9px 12px", borderRadius: radius.md, marginBottom: 8 }}>
-          {voiceList.length === 0 && <option value="">No voices — create one under Voices</option>}
-          {voiceList.map((v) => <option key={v.name} value={v.name}>{v.name}{v.language ? ` · ${v.language}` : ""}</option>)}
-        </select>
-        {!matches.length && voices.length > 0 && (
-          <p style={{ color: colors.muted, fontSize: fonts.xs, marginBottom: 8 }}>No voice tagged for {lang} — showing all voices.</p>
-        )}
+        <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+          <select value={effVoice} onChange={(e) => setVoice(e.target.value)}
+            style={{ flex: 1, background: colors.panel2, border: `1px solid ${colors.border}`, color: colors.text, padding: "9px 12px", borderRadius: radius.md }}>
+            {voiceList.length === 0 && <option value="">No {lang} voice — create one under Voices</option>}
+            {voiceList.map((v) => <option key={v.name} value={v.name}>{v.name}</option>)}
+          </select>
+          <VoicePreviewButton voiceName={effVoice} language={voices.find((v) => v.name === effVoice)?.language || lang} disabled={!effVoice} />
+        </div>
+        <p style={{ color: colors.muted, fontSize: fonts.xs, marginBottom: 8 }}>
+          {voiceList.length === 0
+            ? `No voice tagged for ${lang} — you can add the language now and pick a voice later on each cue's 🎙 chip.`
+            : "Optional — you can also set/change the voice later on each cue's 🎙 chip."}
+        </p>
 
-        <Button variant="primary" disabled={!lang || !effVoice} onClick={() => onAdd(lang, effVoice)}
+        <Button variant="primary" disabled={!lang} onClick={() => onAdd(lang, effVoice)}
           style={{ width: "100%", padding: 12, borderRadius: radius.md, fontWeight: fonts.bold, marginTop: 8 }}>
           Add {lang}
         </Button>
@@ -1811,59 +2282,99 @@ function AddLanguageModal({ voices, existing, onClose, onAdd }) {
   )
 }
 
-/* ─────────────────────────────────────────────────────────────────────────────
-   Character Registry (Recap) — the living, user-editable wiki the narrator uses
-───────────────────────────────────────────────────────────────────────────── */
-
-function CharacterRegistryModal({ registry, onClose, onSave }) {
-  const [chars, setChars] = useState(() => (registry?.characters || []).map((c) => ({ ...c })))
-  const upd = (i, field, val) => setChars((prev) => prev.map((c, k) => (k === i ? { ...c, [field]: val } : c)))
-  const updList = (i, field, val) => upd(i, field, val.split(/[;\n]/).map((s) => s.trim()).filter(Boolean))
-  const addChar = () => setChars((prev) => [...prev, { name: "", aliases: [], current_appearance: "", appearance_history: [], status: "", relationships: [] }])
-  const delChar = (i) => setChars((prev) => prev.filter((_, k) => k !== i))
+function StoryMemoryModal({ memory, onClose, onSaveCharacter, onDeleteCharacter, onUndo, onRedo }) {
+  const [characters, setCharacters] = useState(() => (memory?.characters || []).map((character) => ({ ...character })))
+  const [saving, setSaving] = useState("")
+  const [busy, setBusy] = useState(false)
+  useEffect(() => setCharacters((memory?.characters || []).map((character) => ({ ...character }))), [memory])
+  const update = (id, field, value) => setCharacters((current) => current.map((character) =>
+    character.stable_id === id ? { ...character, [field]: value } : character))
+  const save = async (character) => {
+    setSaving(character.stable_id)
+    try {
+      const next = await onSaveCharacter(character.stable_id, {
+        canonical_name: character.canonical_name,
+        role_label: character.role_label,
+        aliases: (character.aliases || []).join(";").split(";").map((value) => value.trim()).filter(Boolean),
+        appearance: character.appearance,
+        status: character.status,
+      })
+      setCharacters((next?.characters || []).map((item) => ({ ...item })))
+    } finally { setSaving("") }
+  }
+  const applyHistory = async (fn) => {
+    setBusy(true)
+    try { setCharacters(((await fn())?.characters || []).map((item) => ({ ...item }))) }
+    finally { setBusy(false) }
+  }
+  const remove = async (character) => {
+    setBusy(true)
+    try { setCharacters(((await onDeleteCharacter(character.stable_id))?.characters || []).map((item) => ({ ...item }))) }
+    finally { setBusy(false) }
+  }
 
   return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center" }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ width: "90%", maxWidth: 760, height: "85vh", background: colors.panel, border: `1px solid ${colors.border}`, borderRadius: radius.lg, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 20px", borderBottom: `1px solid ${colors.border}` }}>
-          <div>
-            <h2 style={{ color: colors.text, fontSize: fonts.xl, fontWeight: fonts.bold }}>Character Registry</h2>
-            <p style={{ color: colors.muted, fontSize: fonts.xs, marginTop: 2 }}>The narrator resolves identities from this. Fix any mistake here and every later batch inherits it.</p>
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1001, display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div onClick={(event) => event.stopPropagation()} style={{ width: "92%", maxWidth: 900, height: "85vh", background: colors.panel, border: `1px solid ${colors.border}`, borderRadius: radius.lg, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ padding: "16px 20px", borderBottom: `1px solid ${colors.border}`, display: "flex", justifyContent: "space-between", gap: 16 }}>
+          <div style={{ minWidth: 0 }}>
+            <h2 style={{ color: colors.text, fontSize: fonts.xl, fontWeight: fonts.bold }}>Story Memory</h2>
+            <p style={{ color: colors.muted, fontSize: fonts.xs, marginTop: 2, maxWidth: 650, overflowWrap: "anywhere" }}>Canonical characters and narrated events are saved with source-panel evidence. Corrections here are used in the next chapter.</p>
           </div>
-          <button onClick={onClose} style={{ color: colors.muted, fontSize: 22, background: "none", border: "none", cursor: "pointer" }}>✕</button>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <Button variant="secondary" disabled={busy || !memory?.history?.can_undo} onClick={() => applyHistory(onUndo)} style={{ padding: "5px 9px" }}>↶ Undo</Button>
+            <Button variant="secondary" disabled={busy || !memory?.history?.can_redo} onClick={() => applyHistory(onRedo)} style={{ padding: "5px 9px" }}>↷ Redo</Button>
+            <button onClick={onClose} style={{ color: colors.muted, fontSize: 22, background: "none", border: "none", cursor: "pointer" }}>✕</button>
+          </div>
         </div>
-
-        <div style={{ flex: 1, overflowY: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 14 }}>
-          {chars.length === 0 && <div style={{ color: colors.muted, textAlign: "center", padding: 30 }}>No characters yet — they're discovered as you narrate, or add one now.</div>}
-          {chars.map((c, i) => (
-            <div key={i} style={{ border: `1px solid ${colors.border}`, borderRadius: radius.md, padding: 14, background: colors.panel2, display: "flex", flexDirection: "column", gap: 8 }}>
-              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                <input value={c.name || ""} onChange={(e) => upd(i, "name", e.target.value)} placeholder="Name"
-                  style={{ flex: 1, background: colors.panel, border: `1px solid ${colors.border}`, color: colors.text, fontWeight: fonts.bold, padding: "7px 10px", borderRadius: radius.sm }} />
-                <button onClick={() => delChar(i)} title="Remove" style={{ color: colors.error, background: "none", border: "none", fontSize: 16, cursor: "pointer" }}>🗑</button>
+        <div style={{ flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: "minmax(0, 1.2fr) minmax(280px, 0.8fr)" }}>
+          <div style={{ overflowY: "auto", padding: 18, borderRight: `1px solid ${colors.border}` }}>
+            <div style={{ color: colors.textDim, fontSize: fonts.xs, fontWeight: fonts.bold, letterSpacing: "0.08em", marginBottom: 10 }}>CHARACTERS</div>
+            {!characters.length && <div style={{ color: colors.muted, padding: 20 }}>No resolved characters yet. Generate a recap first.</div>}
+            {characters.map((character) => (
+              <div key={character.stable_id} style={{ background: colors.panel2, border: `1px solid ${colors.border}`, borderRadius: radius.md, padding: 12, marginBottom: 10 }}>
+                <div style={{ color: colors.muted, fontSize: "10px", fontFamily: fonts.mono, marginBottom: 8 }}>{character.stable_id} · last verified panel {character.last_seen_panel ?? "—"}</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <input value={character.canonical_name || ""} onChange={(event) => update(character.stable_id, "canonical_name", event.target.value)} placeholder="Canonical name"
+                    style={memoryInput} />
+                  <input value={character.role_label || ""} onChange={(event) => update(character.stable_id, "role_label", event.target.value)} placeholder="Role label if unnamed"
+                    style={memoryInput} />
+                </div>
+                <input value={(character.aliases || []).join("; ")} onChange={(event) => update(character.stable_id, "aliases", event.target.value.split(";").map((value) => value.trim()).filter(Boolean))} placeholder="Aliases, separated by ;"
+                  style={{ ...memoryInput, marginTop: 8 }} />
+                <input value={character.appearance || ""} onChange={(event) => update(character.stable_id, "appearance", event.target.value)} placeholder="Verified appearance"
+                  style={{ ...memoryInput, marginTop: 8 }} />
+                <input value={character.status || ""} onChange={(event) => update(character.stable_id, "status", event.target.value)} placeholder="Current status"
+                  style={{ ...memoryInput, marginTop: 8 }} />
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 9 }}>
+                  <span style={{ color: colors.muted, fontSize: fonts.xs }}>Identity confidence: {Math.round((character.confidence || 0) * 100)}%</span>
+                  <div style={{ display: "flex", gap: 7 }}>
+                    <Button variant="secondary" disabled={busy || saving === character.stable_id} onClick={() => save(character)} style={{ padding: "5px 10px" }}>
+                      {saving === character.stable_id ? "Saving…" : "Save"}
+                    </Button>
+                    <Button variant="danger" disabled={busy} onClick={() => remove(character)} style={{ padding: "5px 10px" }}>Delete</Button>
+                  </div>
+                </div>
               </div>
-              {[["current_appearance", "Current appearance", false], ["status", "Status / what they're doing", false],
-                ["aliases", "Aliases (separate with ;)", true], ["relationships", "Relationships (separate with ;)", true]].map(([f, ph, isList]) => (
-                <input key={f} value={isList ? (c[f] || []).join("; ") : (c[f] || "")}
-                  onChange={(e) => (isList ? updList(i, f, e.target.value) : upd(i, f, e.target.value))} placeholder={ph}
-                  style={{ background: colors.panel, border: `1px solid ${colors.border}`, color: colors.text, padding: "6px 10px", borderRadius: radius.sm, fontSize: fonts.sm }} />
-              ))}
-              {(c.appearance_history || []).length > 0 && (
-                <div style={{ color: colors.muted, fontSize: fonts.xs }}>Past looks: {(c.appearance_history || []).join(" · ")}</div>
-              )}
-            </div>
-          ))}
-          <button onClick={addChar} style={{ alignSelf: "flex-start", color: colors.accent, background: "none", border: `1px dashed ${colors.border}`, borderRadius: radius.md, padding: "8px 14px", cursor: "pointer" }}>+ Add character</button>
-        </div>
-
-        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", padding: "14px 20px", borderTop: `1px solid ${colors.border}` }}>
-          <Button variant="secondary" onClick={onClose}>Cancel</Button>
-          <Button variant="primary" onClick={() => onSave({ characters: chars.filter((c) => (c.name || "").trim()) })}>Save registry</Button>
+            ))}
+          </div>
+          <div style={{ overflowY: "auto", padding: 18 }}>
+            <div style={{ color: colors.textDim, fontSize: fonts.xs, fontWeight: fonts.bold, letterSpacing: "0.08em", marginBottom: 10 }}>RECENT EVIDENCE-BACKED EVENTS</div>
+            {(memory?.events || []).map((event) => (
+              <div key={event.id} style={{ borderLeft: `2px solid ${colors.info}`, paddingLeft: 10, marginBottom: 13 }}>
+                <div style={{ color: colors.muted, fontSize: fonts.xs }}>Panel {event.panel_from ?? "?"}</div>
+                <div style={{ color: colors.text, fontSize: fonts.sm, lineHeight: 1.45 }}>{event.summary}</div>
+              </div>
+            ))}
+            {!memory?.events?.length && <div style={{ color: colors.muted, fontSize: fonts.sm }}>Events will appear after narration.</div>}
+          </div>
         </div>
       </div>
     </div>
   )
 }
+
+const memoryInput = { width: "100%", boxSizing: "border-box", background: colors.panel, border: `1px solid ${colors.border}`, color: colors.text, padding: "7px 9px", borderRadius: radius.sm, fontSize: fonts.sm }
 
 /* ─────────────────────────────────────────────────────────────────────────────
    Between-cue divider — hover to insert a new cue or merge with the next one
@@ -1901,24 +2412,82 @@ function CueDivider({ onInsert, onMerge }) {
    Cue row
 ───────────────────────────────────────────────────────────────────────────── */
 
-function CueRow({ index, cue, active, reviewed, refining, dirty, redubbing, hideOriginal, onToggleReviewed, onPlay, onRefine, onRedub, onChange, onFocus, onBlur, onSelect, refineMode = false, cropTarget = false, onRemovePanel, speakersMap = {}, onSpeakerChange = () => {}, onOpenSpeakerModal = () => {}, onAddSpeaker = () => {}, onDeleteSpeaker = () => {}, onOriginalChange = () => {}, stale = false, sourceLang = "English", noCps = false, onDelete = null }) {
+/* ─────────────────────────────────────────────────────────────────────────────
+   Per-cue panel editor — a cue's thumbnail opens ITS OWN crop, in isolation.
+   Shows the source PDF with ONLY this cue's stored crop box seeded (no other
+   cue's boxes are loaded). Move / resize / redraw / reset / remove, then Save
+   re-crops and updates ONLY this cue — its text, other cues, and their panels
+   are untouched. Save is one atomic undo step (handled by the parent).
+───────────────────────────────────────────────────────────────────────────── */
+
+function PanelEditorModal({ idx, cue, pdfUrl, onOpenPdf, onSave, onRemove, onClose }) {
+  const [busy, setBusy] = useState(false)
+  // Bump to remount the reader → re-seeds from the cue's saved box ("Reset").
+  const [resetKey, setResetKey] = useState(0)
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 210, background: "rgba(0,0,0,0.72)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+      <div onClick={(e) => e.stopPropagation()}
+        style={{ width: "min(1100px, 94vw)", height: "88vh", background: colors.panel, border: `1px solid ${colors.border}`, borderRadius: radius.lg, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 16px", borderBottom: `1px solid ${colors.border}`, flexShrink: 0 }}>
+          {cue.image && (
+            <img src={`${FILES_ORIGIN}${cue.image}`} alt="" style={{ width: 34, height: 44, objectFit: "cover", borderRadius: 4, border: `1px solid ${colors.border}` }} />
+          )}
+          <div style={{ minWidth: 0 }}>
+            <div style={{ color: colors.text, fontWeight: fonts.bold }}>Cue {idx + 1} — edit panel</div>
+            <div style={{ color: colors.muted, fontSize: fonts.xs, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 520 }}>
+              {(cue.text || cue.translated || "").slice(0, 120) || "This cue's own crop — other cues are untouched."}
+            </div>
+          </div>
+          <div style={{ flex: 1 }} />
+          {cue.panelBox && (
+            <Button variant="secondary" size="sm" onClick={() => setResetKey((k) => k + 1)} title="Restore the saved crop box">↺ Reset crop</Button>
+          )}
+          {cue.image && (
+            <Button variant="danger" size="sm" onClick={onRemove} title="Delete this cue's panel image">🗑 Remove panel</Button>
+          )}
+          <button onClick={onClose} style={{ color: colors.muted, fontSize: 20, background: "none", border: "none", cursor: "pointer" }}>✕</button>
+        </div>
+        <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
+          <PdfReader key={resetKey} pdfUrl={pdfUrl} cropping={busy}
+            onOpen={onOpenPdf}
+            initialBox={cue.panelBox || null}
+            attachLabel="💾 Save panel"
+            onAttach={async (data, box) => {
+              setBusy(true)
+              try { await onSave(data, box); return true }
+              catch { return false }
+              finally { setBusy(false) }
+            }} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function CueRow({ index, cue, active, selected = false, onToggleSelect = () => {}, refining, dirty, redubbing, hideOriginal, onPlay, onRefine, onRedub, onChange, onFocus, onBlur, onSelect, refineMode = false, cropTarget = false, onRemovePanel, onEditPanel = null, defaultVoice = "", speakersMap = {}, onSpeakerChange = () => {}, onOpenSpeakerModal = () => {}, onAddSpeaker = () => {}, onDeleteSpeaker = () => {}, onOriginalChange = () => {}, stale = false, sourceLang = "English", noCps = false, onDelete = null }) {
   const cps = cue.cps ?? 0
-  const rushed = cue.rushed ?? cps > 20
+  const rushed = cue.rushed ?? cps > CPS_MAX
+  const [hovered, setHovered] = useState(false)
   const body = (
     <div data-cue={index} onClick={onSelect} style={{ display: "flex", flexDirection: "column", gap: 8, cursor: "pointer" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 10, fontSize: fonts.sm }}>
+        <input type="checkbox" checked={selected}
+          onClick={(e) => e.stopPropagation()}
+          onChange={onToggleSelect}
+          title="Select this cue for a batch action"
+          style={{ accentColor: colors.warning, cursor: "pointer", width: 14, height: 14 }} />
         <span style={{ fontWeight: fonts.bold, fontSize: fonts.md, color: active ? colors.accent : colors.text }}>{String(index + 1).padStart(2, "0")}</span>
-        <button onClick={onToggleReviewed} title="Mark reviewed"
-          style={{ color: reviewed ? colors.success : colors.muted, fontSize: 14, lineHeight: 1 }}>
-          {reviewed ? "✓" : "○"}
-        </button>
-        <SpeakerBadge 
-          speaker={cue.speaker || "Speaker 0"} 
-          speakersMap={speakersMap} 
-          onChange={onSpeakerChange} 
-          onOpenModal={onOpenSpeakerModal} 
-          onAdd={onAddSpeaker} 
-          onDelete={onDeleteSpeaker} 
+        {/* The full multi-speaker control: hover/click to change this cue's
+            speaker, assign a voice ("Change Speaker Voice"), add or delete
+            speakers. Used in every mode (recap included). */}
+        <SpeakerBadge
+          speaker={cue.speaker || "Speaker 0"}
+          speakersMap={speakersMap}
+          defaultVoice={defaultVoice}
+          onChange={onSpeakerChange}
+          onOpenModal={onOpenSpeakerModal}
+          onAdd={onAddSpeaker}
+          onDelete={onDeleteSpeaker}
         />
         {/* No CPS on the ORIGINAL language — its timeline derives FROM the audio
             (repack), so there is no slot to fit and nothing to be "rushed" against. */}
@@ -1938,7 +2507,7 @@ function CueRow({ index, cue, active, reviewed, refining, dirty, redubbing, hide
         <span style={{ color: colors.textDim, background: colors.panel2, border: `1px solid ${colors.border}`, padding: "2px 8px", borderRadius: radius.full, fontVariantNumeric: "tabular-nums" }}>
           {formatTime(cue.start)} - {formatTime(cue.end)}
         </span>
-        {!noCps && <button
+        {!noCps && (rushed || refining) && <button
           onClick={onRefine}
           disabled={refining}
           title="AI: re-translate this line shorter to lower its CPS"
@@ -1969,7 +2538,7 @@ function CueRow({ index, cue, active, reviewed, refining, dirty, redubbing, hide
               : <><IconHeadphones small /> Redub</>}
           </button>
         )}
-        {onDelete && (
+        {onDelete && hovered && (
           <button onClick={(e) => { e.stopPropagation(); onDelete() }} title="Delete cue"
             className="ms-cue-del"
             style={{ width: 22, height: 22, borderRadius: "50%", background: colors.error, color: "#fff", border: "none", fontSize: 12, lineHeight: 1, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>✕</button>
@@ -1978,8 +2547,9 @@ function CueRow({ index, cue, active, reviewed, refining, dirty, redubbing, hide
       </div>
 
       <div style={{
-        border: `1px solid ${active ? colors.accent : colors.border}`,
+        border: `1px solid ${selected ? colors.warning : active ? colors.accent : colors.border}`,
         borderRadius: radius.md, overflow: "hidden",
+        background: selected ? "rgba(251,191,36,0.06)" : "transparent",
         boxShadow: active ? `0 0 0 1px ${colors.accent}` : "none",
       }}>
         {!hideOriginal && (
@@ -2017,11 +2587,13 @@ function CueRow({ index, cue, active, reviewed, refining, dirty, redubbing, hide
 
   if (!refineMode) return body
 
-  // Video Refine: a panel thumbnail to the left. Click it to make this cue the
-  // crop target; ✕ deletes the attached panel.
+  // Video Refine: a panel thumbnail to the left. Click it to edit THIS cue's own
+  // panel crop in isolation (falls back to crop-target select); ✕ deletes it.
   return (
-    <div style={{ display: "flex", gap: 10, alignItems: "stretch" }}>
-      <button onClick={onSelect} title={cropTarget ? "Crop target" : "Make this the crop target"}
+    <div style={{ display: "flex", gap: 10, alignItems: "stretch" }}
+      onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}>
+      <button onClick={onEditPanel || onSelect}
+        title={onEditPanel ? "Edit this cue's panel crop" : cropTarget ? "Crop target" : "Make this the crop target"}
         style={{ width: 70, flexShrink: 0, alignSelf: "flex-start", marginTop: 26, position: "relative",
           aspectRatio: "3 / 4", borderRadius: radius.md, overflow: "hidden", background: colors.panel2,
           border: `2px solid ${cropTarget ? colors.accent : colors.border}`,
@@ -2091,7 +2663,7 @@ function VolumeRow({ icon, label, value, onChange, disabled }) {
    Timeline
 ───────────────────────────────────────────────────────────────────────────── */
 
-const Timeline = forwardRef(function Timeline({ cues, height, pxPerSec, setPxPerSec, totalTime, currentTime, activeIdx, onSeek }, scrollRef) {
+const Timeline = forwardRef(function Timeline({ cues, height, pxPerSec, setPxPerSec, totalTime, currentTime, activeIdx, onSeek, noDubLang = "", dubLang = "" }, scrollRef) {
   const width = Math.max(1000, totalTime * pxPerSec)
   const tickStep = pxPerSec < 60 ? 5 : 1     // seconds between labelled ticks
   const ticks = Math.ceil(totalTime / tickStep) + 1
@@ -2113,6 +2685,12 @@ const Timeline = forwardRef(function Timeline({ cues, height, pxPerSec, setPxPer
         <IconBtn title="Zoom in" onClick={() => setPxPerSec((p) => Math.min(300, p + 20))}>+</IconBtn>
       </div>
 
+      {noDubLang ? (
+        <div style={{ flex: 1, minHeight: 0, display: "flex", alignItems: "center", justifyContent: "center", color: colors.muted, fontSize: fonts.sm, textAlign: "center", padding: 12 }}>
+          No {noDubLang} dub yet — the timeline appears once you generate the {noDubLang} dub.
+        </div>
+      ) : (
+
       <div ref={scrollRef} onClick={onTrackClick}
         style={{ flex: 1, minHeight: 0, overflowX: "auto", overflowY: "hidden", position: "relative", cursor: "text" }}>
         <div style={{ width, height: "100%", position: "relative" }}>
@@ -2129,21 +2707,42 @@ const Timeline = forwardRef(function Timeline({ cues, height, pxPerSec, setPxPer
             })}
           </div>
 
-          {/* Cue blocks */}
+          {/* Cue blocks. Each block = its slot (start→end). Inside it, the SPEECH
+              (actual audio) is a solid bar; the remaining SILENCE up to the next
+              cue is a faded, hatched region — so a short translated line visibly
+              shows the gap of silence before the next cue starts. */}
           <div style={{ position: "absolute", top: 34, bottom: 12, left: 0, right: 0 }}>
             {cues.map((c, i) => {
-              const dur = Math.max(0, c.end - c.start)
+              const slot = Math.max(0, c.end - c.start)
+              const nextStart = cues[i + 1] ? cues[i + 1].start : c.end
+              // Real audio length for the active language, capped to the slot.
+              const rawDur = c.audioDurs?.[dubLang]
+              const speechDur = rawDur != null ? Math.min(Math.max(0, rawDur), nextStart - c.start) : slot
+              const silenceDur = Math.max(0, slot - speechDur)
+              const active = i === activeIdx
               return (
                 <div key={i} title={c.translated}
                   style={{
-                    position: "absolute", left: c.start * pxPerSec, width: Math.max(8, dur * pxPerSec), top: 0, bottom: 0,
-                    background: i === activeIdx ? "#2563eb" : colors.timelineCue,
-                    border: i === activeIdx ? `1px solid ${colors.accent}` : "1px solid rgba(255,255,255,0.08)",
-                    borderRadius: radius.sm, padding: "6px 8px", color: "#fff", overflow: "hidden", fontSize: 11,
-                    boxShadow: "0 2px 4px rgba(0,0,0,0.4)",
+                    position: "absolute", left: c.start * pxPerSec, width: Math.max(8, slot * pxPerSec), top: 0, bottom: 0,
+                    borderRadius: radius.sm, overflow: "hidden", fontSize: 11,
+                    display: "flex",
                   }}>
-                  <div style={{ fontWeight: fonts.bold, marginBottom: 2 }}>{i + 1}</div>
-                  <div style={{ whiteSpace: "nowrap", textOverflow: "ellipsis", overflow: "hidden", opacity: 0.9 }}>{c.translated}</div>
+                  {/* speech */}
+                  <div style={{ width: `${slot > 0 ? (speechDur / slot) * 100 : 100}%`, minWidth: 0, position: "relative",
+                    background: active ? "#2563eb" : colors.timelineCue,
+                    border: active ? `1px solid ${colors.accent}` : "1px solid rgba(255,255,255,0.08)",
+                    borderRadius: silenceDur > 0.02 ? `${radius.sm}px 0 0 ${radius.sm}px` : radius.sm,
+                    padding: "6px 8px", color: "#fff", overflow: "hidden", boxShadow: "0 2px 4px rgba(0,0,0,0.4)" }}>
+                    <div style={{ fontWeight: fonts.bold, marginBottom: 2 }}>{i + 1}</div>
+                    <div style={{ whiteSpace: "nowrap", textOverflow: "ellipsis", overflow: "hidden", opacity: 0.9 }}>{c.translated}</div>
+                  </div>
+                  {/* silence gap (only when audio is shorter than the slot) */}
+                  {silenceDur > 0.02 && (
+                    <div title={`${silenceDur.toFixed(1)}s silence`} style={{ flex: 1, minWidth: 0,
+                      borderTop: "1px dashed rgba(255,255,255,0.14)", borderBottom: "1px dashed rgba(255,255,255,0.14)", borderRight: "1px solid rgba(255,255,255,0.08)",
+                      borderRadius: `0 ${radius.sm}px ${radius.sm}px 0`,
+                      background: "repeating-linear-gradient(45deg, rgba(255,255,255,0.03) 0 6px, transparent 6px 12px)" }} />
+                  )}
                 </div>
               )
             })}
@@ -2155,6 +2754,7 @@ const Timeline = forwardRef(function Timeline({ cues, height, pxPerSec, setPxPer
           </div>
         </div>
       </div>
+      )}
     </div>
   )
 })
@@ -2240,11 +2840,13 @@ function formatTime(secs) {
 }
 
 function maxTime(cues) {
-  return cues.reduce((max, c) => Math.max(max, c.end), 0) + 2
+  // End the timeline exactly at the last cue (a hair of margin for the playhead),
+  // not +2s of empty track past the audio.
+  return cues.reduce((max, c) => Math.max(max, c.end), 0) + 0.2
 }
 
 // Mirrors scripts/speech/cps.py: characters (trimmed) per second.
-const CPS_MAX = 20.0   // non-CJK "rushed" threshold (config.CPS_MAX)
+const CPS_MAX = 24.0   // non-CJK "rushed" threshold — keep in sync with config.CPS_MAX
 /** Effective speaking window for cue i. The dub engine lets audio run until the
  *  NEXT cue starts (minus a breath), so dead air after a short slot is usable
  *  time. Judging CPS against the raw end−start was a phantom constraint — lines
@@ -2262,11 +2864,20 @@ function computeCps(text, durationSec) {
   return durationSec > 0 ? Math.round((n / durationSec) * 10) / 10 : 0
 }
 
+// The default voice for a language: a profile tagged for that language, else an
+// English profile (a sensible default when e.g. Chinese has none), else ANY
+// voice. "" only when there are no voice profiles at all.
+function voiceForLang(voices, lang) {
+  const byLang = (want) => (voices || []).find((v) => (v.language || "").toLowerCase() === want)
+  const l = (lang || "").toLowerCase()
+  return (byLang(l) || byLang("english") || (voices || [])[0])?.name || ""
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────
    Multi-Speaker UI Components
 ───────────────────────────────────────────────────────────────────────────── */
 
-function SpeakerBadge({ speaker, speakersMap, onChange, onOpenModal, onAdd, onDelete }) {
+function SpeakerBadge({ speaker, speakersMap, defaultVoice = "", onChange, onOpenModal, onAdd, onDelete }) {
   const [open, setOpen] = useState(false)
   const ref = useRef()
 
@@ -2278,8 +2889,11 @@ function SpeakerBadge({ speaker, speakersMap, onChange, onOpenModal, onAdd, onDe
     return () => document.removeEventListener("mousedown", handleClickOutside)
   }, [])
 
+  // Show the VOICE PROFILE the cue will actually speak with: the speaker's
+  // assigned voice, else the language default. Falls back to the speaker label
+  // only when there are no voices at all.
   const assignedVoice = speakersMap[speaker]
-  const displayName = speaker === "Speaker 0" ? "Speaker 0" : (assignedVoice || speaker)
+  const displayName = assignedVoice || defaultVoice || speaker
 
   const allSpeakers = Object.keys(speakersMap).length ? Object.keys(speakersMap) : [speaker]
   if (!allSpeakers.includes(speaker)) allSpeakers.push(speaker)
@@ -2316,7 +2930,7 @@ function SpeakerBadge({ speaker, speakersMap, onChange, onOpenModal, onAdd, onDe
                   onClick={(e) => { e.stopPropagation(); setOpen(false); onChange(s) }}
                   style={{ flex: 1, textAlign: "left", background: "none", border: "none", color: s === speaker ? colors.accent : colors.text, cursor: "pointer", fontSize: fonts.sm }}
                 >
-                  {s === "Speaker 0" ? "Speaker 0" : (speakersMap[s] || s)}
+                  {speakersMap[s] || (s === speaker ? defaultVoice : "") || s}
                 </button>
                 {s !== "Speaker 0" && (
                   <button onClick={(e) => { e.stopPropagation(); setOpen(false); onDelete(s) }} style={{ color: colors.error, background: "none", border: "none", cursor: "pointer", fontSize: 12 }}>✕</button>
@@ -2472,4 +3086,3 @@ function SpeakerModal({ speakersMap, setSpeakersMap, voices, onClose, onAddSpeak
     </div>
   )
 }
-

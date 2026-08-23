@@ -9,13 +9,14 @@
  * (refine mode); only the project list + creation live here.
  */
 
-import { useState, useEffect } from "react"
+import { useState } from "react"
 import { useApp, actions, PAGES } from "../store/app"
 import { useNotify } from "../store/notify"
-import { listRefineProjects, createRefineProject } from "../api/videoRefine"
+import { createRefineProject } from "../api/videoRefine"
 import { colors, fonts, radius } from "../theme"
 import Button from "../components/Button"
 import { ProjectDubStudio } from "./DubStudio"
+import RefineProjectList from "./RefineProjectList"
 
 export default function VideoRefine() {
   const { state, dispatch } = useApp()
@@ -31,42 +32,17 @@ export default function VideoRefine() {
 ───────────────────────────────────────────────────────────────────────────── */
 
 function RefineHome({ onOpen }) {
-  const { notify } = useNotify()
-  const [projects, setProjects] = useState(null)
-  const [showNew, setShowNew] = useState(false)
-
-  useEffect(() => {
-    listRefineProjects()
-      .then(setProjects)
-      .catch((e) => { notify({ severity: "error", message: e.message }); setProjects([]) })
-  }, [])
-
   return (
-    <div style={{ flex: 1, overflowY: "auto", background: colors.bg, padding: "26px 28px" }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", maxWidth: 760 }}>
-        <div>
-          <h1 style={{ color: colors.text, fontSize: 26, fontWeight: fonts.bold }}>Video Refine</h1>
-          <p style={{ color: colors.muted, fontSize: fonts.sm, marginTop: 4 }}>
-            Turn a video into a recap: refine the narration and crop high-quality manga panels.
-          </p>
-        </div>
-        <Button variant="primary" onClick={() => setShowNew(true)} style={{ borderRadius: radius.full, padding: "10px 18px", fontWeight: fonts.bold }}>+ New Video Refine</Button>
-      </div>
-      <div style={{ border: `1px solid ${colors.border}`, borderRadius: radius.lg, overflow: "hidden", background: colors.panel, maxWidth: 760, marginTop: 18 }}>
-        {projects === null ? (
-          <div style={{ padding: 40, textAlign: "center", color: colors.muted }}>Loading…</div>
-        ) : projects.length === 0 ? (
-          <div style={{ padding: 40, textAlign: "center", color: colors.muted }}>No video refines yet — click “New Video Refine”.</div>
-        ) : projects.map((p) => (
-          <button key={p.id} onClick={() => onOpen(p.id)}
-            style={{ display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", borderBottom: `1px solid ${colors.border}`, background: "transparent", color: colors.text, textAlign: "left" }}>
-            <span style={{ display: "flex", alignItems: "center", gap: 10 }}><span>🖼</span><span style={{ fontWeight: fonts.medium }}>{p.title}</span></span>
-            <span style={{ color: colors.muted, fontSize: fonts.sm }}>{p.cue_count || 0} cues ›</span>
-          </button>
-        ))}
-      </div>
-      {showNew && <NewRefineModal onClose={() => setShowNew(false)} onCreated={(id) => { setShowNew(false); onOpen(id) }} />}
-    </div>
+    <RefineProjectList
+      kind="video_refine"
+      icon="🖼"
+      title="Video Refine"
+      subtitle="Turn a video into a recap: refine the narration and crop high-quality manga panels."
+      newLabel="+ New Video Refine"
+      emptyText="No video refines yet — click “New Video Refine”."
+      onOpen={onOpen}
+      renderNewModal={({ onClose, onCreated }) => <NewRefineModal onClose={onClose} onCreated={onCreated} />}
+    />
   )
 }
 

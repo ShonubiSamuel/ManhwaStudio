@@ -1,0 +1,6 @@
+# Local Magi v3 visual-grounding runtime.
+# 4.48.x is the compatibility bridge: it supports Magi's Florence code and
+# satisfies the installed WhisperX minimum (>=4.48.0).
+transformers==4.48.3
+timm==1.0.28
+shapely==2.1.2

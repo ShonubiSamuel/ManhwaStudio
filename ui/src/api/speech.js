@@ -34,8 +34,8 @@ export function startAdhocSync(audioUrl, cues, langCode = "fr", projectId = null
 
 /** Per-cue dubbing: synthesize each line separately, place, master. One call →
  *  poll with getAdhocSyncStatus. Replaces the TTS-read + split flow. */
-export function startDubCues(cues, voice, langCode = "French", projectId = null, repackTimings = false) {
-  return post("/speech/dub-cues", { cues, voice, lang_code: langCode, project_id: projectId, repack_timings: repackTimings })
+export function startDubCues(cues, voice, langCode = "French", projectId = null, repackTimings = false, group = true) {
+  return post("/speech/dub-cues", { cues, voice, lang_code: langCode, project_id: projectId, repack_timings: repackTimings, group })
 }
 
 export function getAdhocSyncStatus(jobId) {
@@ -57,8 +57,21 @@ export function listVoiceoverProjects() {
 
 /** Redub ONE cue (re-synthesize just that clip + reassemble the final track).
  *  Watch progress via getAdhocSyncStatus(job_id). @returns the started job. */
-export function startRedubCue(projectId, voice, langCode, cues, index) {
-  return post("/speech/redub-cue", { project_id: projectId, voice, lang_code: langCode, cues, index })
+export function startRedubCue(projectId, voice, langCode, cues, index, group = true) {
+  return post("/speech/redub-cue", { project_id: projectId, voice, lang_code: langCode, cues, index, group })
+}
+
+/** Batch redub: re-voice several cues, then reassemble the track ONCE.
+ *  Watch progress via getAdhocSyncStatus(job_id). @returns the started job. */
+export function startRedubCues(projectId, voice, langCode, cues, indices, group = true) {
+  return post("/speech/redub-cues", { project_id: projectId, voice, lang_code: langCode, cues, indices, group })
+}
+
+/** Restore audio to a snapshot's clip versions (audio undo/redo): copies each
+ *  cue's archived clip back and reassembles. `keys` is per-cue (null = skip).
+ *  Watch progress via getAdhocSyncStatus(job_id). @returns the started job. */
+export function startRestoreAudio(projectId, voice, langCode, cues, keys, group = true) {
+  return post("/speech/restore-audio", { project_id: projectId, voice, lang_code: langCode, cues, keys, group })
 }
 
 /** AI Refine: rewrite the whole narration script at a level (brief|standard|detailed).

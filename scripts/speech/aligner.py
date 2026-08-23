@@ -213,6 +213,24 @@ def _normalize(y, target_rms: float = 0.12, max_gain: float = 6.0):
     return y.astype("float32")
 
 
+def _time_stretch(y, sr: int, rate: float):
+    """Time-compress `y` by `rate` (>1 = faster/shorter). Switchable stretcher so
+    we can A/B artefact quality — config.DUB_STRETCHER selects "signalsmith"
+    (python-stretch) or "rubberband" (pyrubberband, the default/fallback)."""
+    import numpy as np
+    which = (getattr(config, "DUB_STRETCHER", "rubberband") or "rubberband").lower()
+    if which == "signalsmith":
+        import python_stretch as ps
+        st = ps.Signalsmith.Stretch()
+        st.preset(1, int(sr))
+        st.timeFactor = float(rate)          # timeFactor == input/output speed → rate compresses
+        out = st.process(np.ascontiguousarray(y, dtype="float32")[np.newaxis, :])
+        return np.asarray(out).reshape(-1).astype("float32")
+    import pyrubberband as pyrb
+    # crispness 6 = best transient preservation → cleaner speech.
+    return pyrb.time_stretch(y, sr, rate, rbargs={"-c": "6"})
+
+
 def assemble_track(
     placements:     List[dict],
     total_duration: float,
@@ -221,6 +239,7 @@ def assemble_track(
     max_stretch:    Optional[float] = None,
     fade_ms:        float = 15.0,
     on_log:         Optional[Callable] = None,
+    breathe:        Optional[bool] = None,   # override the config default (recaps → False)
 ) -> bool:
     """
     placements: [{"path": wav, "start": seconds}, ...] in time order.
@@ -242,7 +261,7 @@ def assemble_track(
     min_gap = rs.get_float("dub_speech_min_gap", getattr(config, "DUB_SPEECH_MIN_GAP", 0.06))
     # Breathing room: fill long silences by lengthening a short line's internal
     # pauses (no stretching) instead of leaving dead air.
-    breathe       = bool(getattr(config, "DUB_BREATHE_ENABLE", True))
+    breathe       = bool(getattr(config, "DUB_BREATHE_ENABLE", True)) if breathe is None else bool(breathe)
     breathe_fill  = rs.get_float("dub_breathe_fill_ratio", getattr(config, "DUB_BREATHE_FILL_RATIO", 0.85))
     breathe_pause = rs.get_float("dub_breathe_max_pause",  getattr(config, "DUB_BREATHE_MAX_PAUSE", 0.7))
 
@@ -289,11 +308,10 @@ def assemble_track(
             rate = min(max_stretch, dur / allow)
             if rate > 1.02:
                 try:
-                    import pyrubberband as pyrb
-                    # crispness 6 = best transient preservation → cleaner speech.
-                    y = pyrb.time_stretch(y, sr, rate, rbargs={"-c": "6"})
+                    y = _time_stretch(y, sr, rate)
                     compressed += 1
-                    note = f"sped {rate:.2f}×" + (" (capped — may overrun)" if dur / allow > max_stretch + 0.01 else "")
+                    which = getattr(config, "DUB_STRETCHER", "rubberband")
+                    note = f"sped {rate:.2f}× ({which})" + (" (capped — may overrun)" if dur / allow > max_stretch + 0.01 else "")
                 except Exception as exc:
                     log(f"  cue {i}: stretch failed ({exc}) — placing as-is", "warning")
                     note = "as-is(no stretch)"

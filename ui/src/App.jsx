@@ -13,6 +13,7 @@ import Voiceover  from "./pages/Voiceover"
 import VideoRefine from "./pages/VideoRefine"
 import Recap from "./pages/Recap"
 import Voices     from "./pages/Voices"
+import TextToSpeech from "./pages/TextToSpeech"
 import ComingSoon from "./pages/ComingSoon"
 import Settings   from "./pages/Settings"
 import Logs       from "./pages/Logs"
@@ -44,6 +45,9 @@ function PageRouter() {
       </div>
       <div style={{ display: p === PAGES.VOICES ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
         <Voices />
+      </div>
+      <div style={{ display: p === PAGES.TTS ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
+        <TextToSpeech />
       </div>
       <div style={{ display: p === PAGES.SETTINGS ? "flex" : "none", flex: 1, flexDirection: "column", overflow: "hidden" }}>
         <Settings />

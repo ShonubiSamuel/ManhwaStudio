@@ -13,6 +13,7 @@ The run streams logs/progress through the same SSE channel as the pipeline
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -22,7 +23,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from api.deps import get_db
-from api.events import emit_log, emit_progress, emit_stage_done, clear_queue
 from api.models import AdhocTranslateRequest, AdhocTranslateJob, AdhocSyncRequest, AdhocSyncJob
 from database import Database
 import config
@@ -30,102 +30,10 @@ import uuid
 
 router = APIRouter(tags=["Speech dub"])
 
-_threads: dict = {}
 _lock = threading.Lock()
 
 _adhoc_jobs: dict = {}
 _adhoc_jobs_lock = threading.Lock()
-
-
-class SpeechDubRequest(BaseModel):
-    target_langs: List[str]
-    keep_music:   Optional[bool] = None
-
-
-def _resolve_voice(db: Database, episode_id: int, lang: str):
-    """Per-episode dub_profiles assignment, else first voice matching the language."""
-    from tts.voice_profile import VoiceProfileManager
-    vpm = VoiceProfileManager(str(config.VOICES_DIR))
-    try:
-        profiles = db.get_setting_json(f"dub_profiles_{episode_id}", {}) or {}
-    except Exception:
-        profiles = {}
-    name = profiles.get(lang) if isinstance(profiles, dict) else None
-    if name and vpm.exists(name):
-        return vpm.load(name)
-    want = config.SUPPORTED_LANGUAGES.get(lang, "").lower()
-    for n in vpm.list_profiles():
-        p = vpm.load(n)
-        if p and (getattr(p, "language", "") or "").lower() == want:
-            return p
-    return None
-
-
-def _run(episode_id: int, video: str, langs: List[str], keep_music, db: Database) -> None:
-    from speech import pipeline as sp
-    log = lambda m, lvl="info": emit_log(episode_id, m, lvl)
-    ok = False
-    try:
-        provider = db.get_setting("ai_provider_translate", "nvidia")
-        api_key  = db.get_setting("nvidia_api_key", "")
-        lm_model = db.get_setting("lm_studio_model", "")
-        try:    ctx = int(db.get_setting("lm_studio_context_length", "32768"))
-        except (TypeError, ValueError): ctx = 32768
-        ep   = db.get_episode(episode_id) or {}
-        work = Path(ep.get("output_folder") or (Path(config.OUTPUT_DIR) / str(episode_id))) / "speech_dub"
-
-        log("▶  Speech-segment dubbing started …", "accent")
-        results = sp.run_speech_dub(
-            video, langs,
-            voice_for      = lambda lc: _resolve_voice(db, episode_id, lc),
-            work_dir       = str(work),
-            keep_music     = keep_music,
-            provider       = provider, api_key = api_key,
-            lm_studio_model= lm_model, context_length = ctx,
-            tone_text      = ep.get("tone_prompt") or "",
-            on_log         = log,
-            on_progress    = lambda done, tot: emit_progress(episode_id, round(done / tot * 100) if tot else 0,
-                                                             f"{done}/{tot} languages"),
-        )
-        good = [lc for lc, r in results.items() if r.ok]
-        bad  = [f"{lc} ({r.error})" for lc, r in results.items() if not r.ok]
-        if good:
-            log(f"✓  Dubbed: {', '.join(good)}", "success")
-        if bad:
-            log(f"✗  Failed: {', '.join(bad)}", "error")
-        ok = bool(good)
-    except Exception as exc:
-        emit_log(episode_id, f"✗  Speech dub crashed: {exc}", "error")
-        ok = False
-    finally:
-        emit_stage_done(episode_id, "speech_dub", ok)
-        with _lock:
-            _threads.pop(episode_id, None)
-
-
-@router.post("/speech/dub/{episode_id}", status_code=202)
-def start_speech_dub(episode_id: int, body: SpeechDubRequest, db: Database = Depends(get_db)):
-    ep = db.get_episode(episode_id)
-    if not ep:
-        raise HTTPException(404, f"Episode {episode_id} not found")
-    video = ep.get("source_path") or ""
-    if not video or not Path(video).exists():
-        raise HTTPException(400, "Episode has no source video on disk")
-    if not body.target_langs:
-        raise HTTPException(400, "No target languages selected")
-
-    with _lock:
-        t = _threads.get(episode_id)
-        if t and t.is_alive():
-            raise HTTPException(409, "A speech dub is already running for this episode")
-        clear_queue(episode_id)
-        th = threading.Thread(
-            target=_run, args=(episode_id, video, body.target_langs, body.keep_music, db),
-            daemon=True, name=f"speechdub-ep{episode_id}",
-        )
-        _threads[episode_id] = th
-        th.start()
-    return {"ok": True, "message": f"Speech dub started for {len(body.target_langs)} language(s)"}
 
 
 def _files_url(abs_path: Path) -> str:
@@ -136,59 +44,6 @@ def _files_url(abs_path: Path) -> str:
         return ""
 
 
-@router.get("/speech/cues/{episode_id}/{lang}")
-def get_cues(episode_id: int, lang: str, db: Database = Depends(get_db)):
-    ep = db.get_episode(episode_id)
-    if not ep:
-        raise HTTPException(404, f"Episode {episode_id} not found")
-    path = Path(ep.get("output_folder") or "") / "speech_dub" / lang / "cues.json"
-    if not path.exists():
-        return []
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
-
-def _persist_adhoc_log(job_id: str, stage: str, db: Database, duration_secs: float, is_sync_job: bool = False, project_name: str = "Dub Studio"):
-    job = _adhoc_sync_jobs.get(job_id) if is_sync_job else _adhoc_jobs.get(job_id)
-    if not job:
-        return
-    try:
-        db.log_adhoc_activity(
-            stage=stage,
-            status=job.get("status", "failed"),
-            duration_secs=duration_secs,
-            log_lines=job.get("log", []),
-            error=job.get("error", ""),
-            project_name=project_name
-        )
-    except Exception:
-        pass
-
-
-@router.get("/speech/result/{episode_id}/{lang}")
-def get_result(episode_id: int, lang: str, db: Database = Depends(get_db)):
-    """Everything the editor needs for a language: cues + playable URLs."""
-    ep = db.get_episode(episode_id)
-    if not ep:
-        raise HTTPException(404, f"Episode {episode_id} not found")
-    base  = Path(ep.get("output_folder") or "") / "speech_dub" / lang
-    cpath = base / "cues.json"
-    cues  = []
-    if cpath.exists():
-        try:
-            cues = json.loads(cpath.read_text(encoding="utf-8"))
-        except Exception:
-            cues = []
-    video = base / f"dubbed_{lang}.mp4"
-    audio = base / "final.wav"
-    return {
-        "cues":      cues,
-        "video_url": _files_url(video) if video.exists() else "",
-        "audio_url": _files_url(audio) if audio.exists() else "",
-        "exists":    cpath.exists(),
-    }
 
 
 def _run_adhoc_translate(job_id: str, source_path: str, lang: str):
@@ -461,7 +316,7 @@ def _run_adhoc_sync(job_id: str, req: AdhocSyncRequest):
             
         total_duration = 0.0
         if req.cues:
-            total_duration = max([float(c.get("end", 0)) for c in req.cues]) + 2.0
+            total_duration = max([float(c.get("end", 0)) for c in req.cues]) + 0.4
             
         _set(message="Aligning and crossfading audio...")
         raw_path   = str(work / "synced_raw.wav")
@@ -527,6 +382,8 @@ class DubCuesRequest(BaseModel):
     project_id: Optional[int] = None
     warmup:     Optional[str] = "Bonjour à tous."   # discarded first generation
     repack_timings: bool = False
+    group:      bool = True   # False for recaps: each panel is its OWN clip (with
+                              # real silence between), never merged into one read
 
 
 def _balanced_comma_split(text: str):
@@ -541,25 +398,6 @@ def _balanced_comma_split(text: str):
     c = min(commas, key=lambda i: abs(i - mid))
     a, b = text[:c].strip(), text[c + 1:].strip()
     return [a, b] if a and b else [text]
-
-
-def _level_clip(path: str, target_rms: float = 0.08, max_gain: float = 4.0):
-    """Bring a clip toward a common loudness so cues don't jump in volume."""
-    import soundfile as sf, numpy as np
-    try:
-        y, sr = sf.read(path, dtype="float32", always_2d=False)
-    except Exception:
-        return
-    if getattr(y, "ndim", 1) > 1:
-        y = y.mean(axis=1)
-    rms = float(np.sqrt(np.mean(y ** 2))) if len(y) else 0.0
-    if rms < 0.005:                       # near-silent — don't amplify noise
-        return
-    y = y * min(target_rms / rms, max_gain)
-    peak = float(np.max(np.abs(y))) if len(y) else 0.0
-    if peak > 0.99:
-        y = y * (0.99 / peak)
-    sf.write(path, y.astype("float32"), sr, subtype="PCM_16")
 
 
 def _dub_groups(cues: list, default_voice: str) -> list:
@@ -593,7 +431,6 @@ def _dub_groups(cues: list, default_voice: str) -> list:
 
 
 def _run_dub_cues(job_id: str, req: DubCuesRequest):
-    from tts import synth
     from tts.voice_profile import VoiceProfileManager
     from speech import aligner, cps
     from speech.master import master
@@ -643,16 +480,23 @@ def _run_dub_cues(job_id: str, req: DubCuesRequest):
         # generation — real cross-sentence prosody instead of per-cue "islands"
         # that each end on a full-stop melody. Each group is ONE clip placed at
         # the group's start, spanning the combined slot (no re-splitting needed).
-        groups = _dub_groups(cues, req.voice)
+        # Recaps (group=False): one clip per cue, so every panel is its own audio
+        # with real silence between — never merged into a single continuous read.
+        groups = _dub_groups(cues, req.voice) if getattr(req, "group", True) else [[i] for i in range(len(cues))]
         joined = sum(1 for g in groups if len(g) > 1)
         if joined:
             _log(f"flow: joined {joined} contiguous group(s) for smoother prosody", "muted")
+
+        def _speakable(t: str) -> str:
+            # Shared with the Voices preview — one normalisation, one source of truth.
+            from tts import clip as _clip
+            return _clip.speakable(t)
 
         segments_by_voice = {}
         for g in groups:
             first, last = g[0], g[-1]
             voice_name = cues[first].get("voice") or req.voice
-            text = " ".join((cues[i].get("translated") or "").strip() for i in g).strip()
+            text = " ".join(_speakable((cues[i].get("translated") or "").strip()) for i in g).strip()
             start = float(cues[first].get("start", 0)); end = float(cues[last].get("end", 0))
             nxt = float(cues[last + 1]["start"]) if last + 1 < len(cues) else end
             slot = max(0.05, nxt - start)
@@ -661,16 +505,12 @@ def _run_dub_cues(job_id: str, req: DubCuesRequest):
             # handled by breathing (lengthening those real pauses).
             seg = {"cue": first, "sub": 0, "nsub": 1, "text": text, "members": list(g),
                    "path": str(work / f"cue_{first:04d}_0.wav"), "slot": slot, "start": start, "next": nxt}
-            # Warm the model up INSIDE the clip's OWN generation, so the first
-            # real words aren't synthesised as an unstable "first utterance" (the
-            # hiccup). The warm-up audio is stripped back off after synthesis. A
-            # separate warm-up clip does NOT help — the model resets per
-            # generation, so the prefix must share the call.
+            # Record the warm-up word (prepended INSIDE the clip's own generation,
+            # then stripped) that stabilises the first token. The shared pipeline
+            # (clip.synth_clips) does the prepend + strip; we keep seg["text"] raw.
             if per_cue and warm_word:                 # every generation gets a running start
-                seg["text"] = f"{warm_word} {text}"
                 seg["strip_warmup"] = warm_word
             elif warm and first == 0:                 # else just cue 1 (old behaviour)
-                seg["text"] = f"{warm} {text}"
                 seg["strip_warmup"] = warm
             segments_by_voice.setdefault(voice_name, []).append(seg)
             # Remove stale clips for absorbed members (and legacy split halves) so
@@ -683,62 +523,32 @@ def _run_dub_cues(job_id: str, req: DubCuesRequest):
                         except OSError: pass
 
         _set(message="Generating voiceover (grouped cues)…")
-        
+
+        # Generate + clean every clip through the ONE shared per-clip pipeline —
+        # identical to the Voices preview and redub. Each voice's clips render in a
+        # single model load; clip.synth_clips also does the warm-up strip, hum/onset
+        # cleanup, silence trim and levelling. (Cue grouping above + track assembly
+        # below stay here, since those are timeline concerns.)
+        from tts import clip as _clip
         all_segments = []
         for voice_name, voice_segments in segments_by_voice.items():
             profile = vpm.load(voice_name)
             if not profile:
                 _set(status="failed", error=f"Voice '{voice_name}' not found"); return
             profile.language = req.lang_code
-            
-            sentences = [s["text"] for s in voice_segments]
-            outpaths  = [s["path"] for s in voice_segments]
-            script = synth.build_synth_script(profile=profile, sentences=sentences, output_paths=outpaths, skip_indices=set())
-            
-            import subprocess
-            r = subprocess.run([synth.synth_python(profile), "-c", script], capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=1800, env=synth.synth_env(profile))
-            made = sum(1 for s in voice_segments if Path(s["path"]).exists())
-            if made < len([s for s in voice_segments if s["cue"] >= 0]):
-                _set(status="failed", error=f"Synthesis failed for voice {voice_name}.\n" + (r.stdout or "")[-300:] + "\n" + (r.stderr or "")[-400:]); return
-            
+            ok = _clip.synth_clips(
+                profile,
+                [s["text"] for s in voice_segments],
+                [s["path"] for s in voice_segments],
+                warmups=[s.get("strip_warmup", "") for s in voice_segments],
+                clean=True, save_stages=getattr(config, "DUB_SAVE_STAGES", False),
+                comf=comf, on_log=_log, timeout=1800)
+            if not ok:
+                _set(status="failed", error=f"Synthesis failed for voice {voice_name}."); return
             all_segments.extend(voice_segments)
 
         # Sort segments back into original chronological order
         segments = sorted(all_segments, key=lambda s: (s["cue"], s["sub"]))
-
-        # Clean each clip's onset, then level for consistent loudness:
-        #  • the first clip: strip the prepended warm-up lead (by pause), and
-        #  • EVERY clip: trim the soft "shaky" onset wobble (model first-token
-        #    instability) without clipping the word.
-        from speech.wordsplit import strip_lead_segment
-        _set(message="Cleaning & levelling clips…")
-        for s in segments:
-            if not Path(s["path"]).exists():
-                continue
-            try:
-                y, sr = sf.read(s["path"])
-                if getattr(y, "ndim", 1) > 1:
-                    y = y.mean(axis=1)
-                if s.get("strip_warmup"):
-                    y2, stripped = strip_lead_segment(y, sr, on_log=_log)
-                    if stripped < 0.15:               # no clear pause → estimate & trim
-                        est = len(s["strip_warmup"]) / max(1.0, comf) + 0.15
-                        cut = int(min(est, len(y) / sr * 0.6) * sr)
-                        y2 = y[cut:]
-                        _log(f"warm-up: estimate-trimmed {cut / sr:.2f}s lead", "muted")
-                    y = y2
-                y = aligner.strip_leading_hum(y, sr)   # remove a 'hmm/mmm' lead-in
-                y = aligner.trim_onset_wobble(y, sr)   # remove the shaky lead-in
-                # Trim BOTH ends of near-silence in the FILE. Critical for repack:
-                # the packed timeline is computed from file lengths, but the
-                # assembler trims silence at placement — untrimmed tails became
-                # audible gaps between every cue of the original-language dub.
-                y = aligner._trim_silence(y, sr)
-                sf.write(s["path"], y, sr)
-            except Exception as exc:
-                _log(f"onset clean failed for cue {s['cue']}: {exc}", "warning")
-            _level_clip(s["path"])
 
         # Build placements. One clip per group, placed at the group's start; the
         # clip internally carries the group's natural cross-sentence prosody.
@@ -782,20 +592,57 @@ def _run_dub_cues(job_id: str, req: DubCuesRequest):
                     updated_cues[i] = c
                 current_time += 0.3  # natural breath between passages (clips are now silence-trimmed)
             updated_cues = [c for c in updated_cues if c is not None]
+            # PERFECT SPLIT: no dead gaps in the timeline. Each cue's slot runs right
+            # up to the next cue's start, so the inter-cue breath is absorbed INTO the
+            # slot (audio still breathes; the timeline tiles seamlessly). The cues now
+            # sum exactly to the track's spoken length — e.g. a 3:00 read of two even
+            # cues becomes 1:30 + 1:30 with no gap between them.
+            for a, b in zip(updated_cues, updated_cues[1:]):
+                a["end"] = b["start"]
         else:
             for i, seg in by_head.items():
                 placements.append({"path": seg["path"], "start": seg["start"]})
 
         placements.sort(key=lambda p: p["start"])
 
+        # Per-cue ACTUAL audio length (the clip's real duration, split across a
+        # group's member cues by text share). The editor uses this to show where
+        # each cue's audio ends and the silence gap before the next cue — most
+        # visible on translations that are shorter than the original slot.
+        audio_durs = [0.0] * len(cues)
+        for seg in real:
+            members = seg.get("members", [seg["cue"]])
+            total = _clip_dur(seg["path"])
+            weights = [max(1, len((cues[m].get("translated") or "").strip())) for m in members]
+            tot = float(sum(weights)) or 1.0
+            for m, w in zip(members, weights):
+                if 0 <= m < len(cues):
+                    audio_durs[m] = round(total * (w / tot), 3)
+
         if getattr(req, "repack_timings", False) and updated_cues:
-            total_duration = max(float(c.get("end", 0)) for c in updated_cues) + 2.0
+            total_duration = max(float(c.get("end", 0)) for c in updated_cues) + 0.4
         else:
-            total_duration = max(float(c.get("end", 0)) for c in cues) + 2.0
-            
+            total_duration = max(float(c.get("end", 0)) for c in cues) + 0.4
+
+        # Audit: the TRUE combined output at natural pace — every cue's clip glued
+        # back-to-back at its own length, NO timeline fitting, NO speed-compression.
+        # This is the honest uncompressed combined length; synced_raw.wav below is the
+        # SAME clips fit to the video timeline (and sped up if they overran their
+        # slot), so combined_natural vs synced_raw isolates what the timing step did.
+        if getattr(config, "DUB_SAVE_STAGES", False) and real:
+            try:
+                from core.audio_utils import concat_wavs
+                concat_wavs([s["path"] for s in real], str(work / "combined_natural.wav"), silence_secs=0.3)
+                _log(f"audit: combined_natural.wav = {len(real)} clip(s) at natural pace", "muted")
+            except Exception as exc:
+                _log(f"audit: combined_natural failed: {exc}", "warning")
+
         _set(message="Assembling track…")
         raw = str(work / "synced_raw.wav")
-        if not aligner.assemble_track(placements, total_duration, raw, on_log=_log):
+        # Recaps (group=False) don't breathe short lines to fill the slot — they
+        # keep a real pause of silence after each panel.
+        if not aligner.assemble_track(placements, total_duration, raw, on_log=_log,
+                                      breathe=getattr(req, "group", True)):
             _set(status="failed", error="Assembly failed."); return
 
         _set(message="Mastering audio…")
@@ -804,11 +651,13 @@ def _run_dub_cues(job_id: str, req: DubCuesRequest):
             final = raw
         final_url = _files_url(Path(final))
         
+        # Archive every clip so this whole audio state is undoable later.
+        audio_keys = _archive_and_key(cues, work, req.voice, getattr(req, "group", True))
         if getattr(req, "repack_timings", False):
-            _set(status="done", message="Done", synced_audio_url=final_url, updated_cues=updated_cues)
+            _set(status="done", message="Done", synced_audio_url=final_url, updated_cues=updated_cues, audio_durs=audio_durs, audio_keys=audio_keys)
         else:
-            _set(status="done", message="Done", synced_audio_url=final_url)
-            
+            _set(status="done", message="Done", synced_audio_url=final_url, audio_durs=audio_durs, audio_keys=audio_keys)
+
         _log(f"Dub complete in {time.time() - start_time:.1f}s")
     except Exception as exc:
         _set(status="failed", error=str(exc))
@@ -833,32 +682,78 @@ def dub_cues(req: DubCuesRequest, db: Database = Depends(get_db)):
 # track (just audio placement, no TTS) — never re-voice every cue. This is what
 # makes the editor usable on hours of audio.
 
-def _clean_cue_clip(path: str, strip_warmup: str, comf: float, _log) -> None:
-    """Apply the same onset cleanups as the full dub to a single clip."""
+def _audio_durs_from_disk(cues: list, work: Path, default_voice: str, group: bool) -> list:
+    """Per-cue ACTUAL audio length, read from the clips ON DISK. A group is one
+    clip on its head cue; its duration is split across the group's member cues by
+    text share — the same attribution _run_dub_cues does in memory. The editor's
+    timeline uses this to draw where each cue's speech ends and the silence begins.
+    Grouping must match generation exactly, so mirror the redub's own choice."""
     import soundfile as sf
-    from speech import aligner
-    from speech.wordsplit import strip_lead_segment
+    def _dur(p):
+        try:
+            info = sf.info(str(p)); return float(info.frames) / float(info.samplerate or 1)
+        except Exception:
+            return 0.0
+    groups = _dub_groups(cues, default_voice) if group else [[i] for i in range(len(cues))]
+    durs = [0.0] * len(cues)
+    for g in groups:
+        head = g[0]
+        p = work / f"cue_{head:04d}_0.wav"
+        if not p.exists():
+            continue
+        total = _dur(p)
+        weights = [max(1, len((cues[m].get("translated") or "").strip())) for m in g]
+        tot = float(sum(weights)) or 1.0
+        for m, w in zip(g, weights):
+            if 0 <= m < len(cues):
+                durs[m] = round(total * (w / tot), 3)
+    return durs
+
+
+# ── Audio history (undo/redo of the actual generated audio) ──────────────────
+# TTS is non-deterministic, so "undo to the previous audio" can't re-synthesise —
+# it must restore the exact clip that was live before. Every time a cue's clip is
+# (re)generated we copy it into work/history/<key>.wav and hand the key back; the
+# editor stores it on the cue, so an undo snapshot carries the audio identity and
+# can be materialised again by _run_restore_audio.
+
+def _archive_clip(work: Path, head: int) -> str:
+    """Copy a freshly generated head clip into the history store and return its key
+    (''  if the clip isn't on disk)."""
+    import shutil, uuid
+    src = work / f"cue_{head:04d}_0.wav"
+    if not src.exists():
+        return ""
+    hist = work / "history"
     try:
-        y, sr = sf.read(path)
-        if getattr(y, "ndim", 1) > 1:
-            y = y.mean(axis=1)
-        if strip_warmup:
-            y2, stripped = strip_lead_segment(y, sr, on_log=_log)
-            if stripped < 0.15:
-                est = len(strip_warmup) / max(1.0, comf) + 0.15
-                cut = int(min(est, len(y) / sr * 0.6) * sr)
-                y2 = y[cut:]
-            y = y2
-        y = aligner.strip_leading_hum(y, sr)
-        y = aligner.trim_onset_wobble(y, sr)
-        y = aligner._trim_silence(y, sr)   # keep file length ≈ speech (repack packs by file length)
-        sf.write(path, y, sr)
-    except Exception as exc:
-        _log(f"clean failed: {exc}", "warning")
-    _level_clip(path)
+        hist.mkdir(exist_ok=True)
+        key = f"{head:04d}_{uuid.uuid4().hex[:10]}"
+        shutil.copy2(src, hist / f"{key}.wav")
+        return key
+    except OSError:
+        return ""
 
 
-def _assemble_project_dub(cues: list, work: Path, _log) -> str | None:
+def _archive_and_key(cues: list, work: Path, default_voice: str, group: bool,
+                     changed_heads: set | None = None) -> list:
+    """Archive the group-head clips and return a per-cue list of version keys (a
+    group's members share the head's key). `changed_heads=None` archives every
+    group (a full generate); otherwise only those heads are archived and every
+    other cue's entry is None so the editor keeps its existing key."""
+    groups = _dub_groups(cues, default_voice) if group else [[i] for i in range(len(cues))]
+    keys: list = [None] * len(cues)
+    for g in groups:
+        head = g[0]
+        if changed_heads is not None and head not in changed_heads:
+            continue
+        k = _archive_clip(work, head)
+        for m in g:
+            if 0 <= m < len(cues):
+                keys[m] = k
+    return keys
+
+
+def _assemble_project_dub(cues: list, work: Path, _log, breathe: bool = True) -> str | None:
     """Reassemble the final track from each cue's existing clip (cue_NNNN_0.wav)
     placed at its start, then master. Returns the /files URL or None."""
     import soundfile as sf
@@ -871,10 +766,10 @@ def _assemble_project_dub(cues: list, work: Path, _log) -> str | None:
             placements.append({"path": str(p), "start": float(c.get("start", 0))})
     if not placements:
         return None
-    total = max(float(c.get("end", 0)) for c in cues) + 2.0
+    total = max(float(c.get("end", 0)) for c in cues) + 0.4
     raw   = str(work / "synced_raw.wav")
     final = str(work / "synced_final.wav")
-    if not aligner.assemble_track(placements, total, raw, on_log=_log):
+    if not aligner.assemble_track(placements, total, raw, on_log=_log, breathe=breathe):
         return None
     if not master(raw, final, on_log=_log):
         final = raw
@@ -882,7 +777,6 @@ def _assemble_project_dub(cues: list, work: Path, _log) -> str | None:
 
 
 def _run_redub_cue(job_id: str, req: "RedubCueRequest"):
-    from tts import synth
     from tts.voice_profile import VoiceProfileManager
     from speech import cps
     from pathlib import Path as _P
@@ -925,14 +819,12 @@ def _run_redub_cue(job_id: str, req: "RedubCueRequest"):
         # grouping is deterministic on the cue list, so recompute it and re-voice
         # the WHOLE group. That keeps the cross-sentence flow intact and keeps the
         # one-clip-per-group file layout consistent with the full dub.
-        grp = next((g for g in _dub_groups(req.cues, req.voice) if i in g), [i])
+        grp = (next((g for g in _dub_groups(req.cues, req.voice) if i in g), [i])
+               if getattr(req, "group", True) else [i])
         head = grp[0]
         text = " ".join((req.cues[m].get("translated") or "").strip() for m in grp).strip()
         if not text:
             _set(status="failed", error="Cue has no text to dub"); return
-        warm = config.DUB_WARMUP_WORD if (getattr(config, "DUB_WARMUP_PER_CUE", False)
-                                          and getattr(config, "DUB_WARMUP_WORD", "")) else ""
-        gen_text = f"{warm} {text}" if warm else text
         path = work / f"cue_{head:04d}_0.wav"
         # drop stale member clips + legacy split halves (their words are in the group clip)
         for m in grp:
@@ -943,21 +835,24 @@ def _run_redub_cue(job_id: str, req: "RedubCueRequest"):
                     except OSError: pass
 
         _set(message=f"Re-voicing cue {i + 1}" + (f" (group of {len(grp)})" if len(grp) > 1 else "") + "…")
-        script = synth.build_synth_script(profile=profile, sentences=[gen_text],
-                                          output_paths=[str(path)], skip_indices=set())
-        r = subprocess.run([synth.synth_python(profile), "-c", script], capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=600, env=synth.synth_env(profile))
-        if not path.exists():
-            _set(status="failed", error="Synthesis failed.\n" + (r.stderr or "")[-400:]); return
-
-        _set(message="Cleaning clip…")
-        _clean_cue_clip(str(path), warm, comf, _log)
+        # Generate + clean via the SHARED pipeline (same as the full dub / preview).
+        from tts import clip as _clip
+        if not _clip.synth_clip(profile, text, str(path), warmup=_clip.warmup_word(),
+                                save_stages=getattr(config, "DUB_SAVE_STAGES", False),
+                                comf=comf, on_log=_log, timeout=600) or not path.exists():
+            _set(status="failed", error="Synthesis failed."); return
 
         _set(message="Reassembling track…")
-        url = _assemble_project_dub(req.cues, work, _log)
+        url = _assemble_project_dub(req.cues, work, _log, breathe=getattr(req, "group", True))
         if not url:
             _set(status="failed", error="Reassembly failed"); return
-        _set(status="done", message="Cue redubbed!", synced_audio_url=url)
+        # Return the fresh per-cue durations so the editor's timeline updates the
+        # re-voiced cue's speech/silence split (not just the audio) immediately, plus
+        # the new clip's version key (only this group's cues change) for audio-undo.
+        grouping = getattr(req, "group", True)
+        audio_durs = _audio_durs_from_disk(req.cues, work, req.voice, grouping)
+        audio_keys = _archive_and_key(req.cues, work, req.voice, grouping, changed_heads={head})
+        _set(status="done", message="Cue redubbed!", synced_audio_url=url, audio_durs=audio_durs, audio_keys=audio_keys)
         _log(f"▶ Redubbed cue {i + 1}.", "success")
     except Exception as exc:
         _set(status="failed", error=str(exc))
@@ -972,6 +867,7 @@ class RedubCueRequest(BaseModel):
     lang_code:  str = "French"
     cues:       List[dict]      # all cues (for timing + reassembly)
     index:      int             # which cue to re-voice
+    group:      bool = True     # False for recaps: re-voice only this cue
 
 
 @router.post("/speech/redub-cue", response_model=AdhocSyncJob)
@@ -982,6 +878,208 @@ def redub_cue(req: RedubCueRequest):
         _adhoc_sync_jobs[job_id] = {"job_id": job_id, "status": "running", "message": "Queued …",
                                     "synced_audio_url": "", "log": [], "error": ""}
     threading.Thread(target=_run_redub_cue, args=(job_id, req), daemon=True).start()
+    return AdhocSyncJob(**_adhoc_sync_jobs[job_id])
+
+
+# ── Batch redub — re-voice SEVERAL cues, then reassemble ONCE ─────────────────
+# The single-cue redub reassembles+masters the whole track every call. When the
+# editor fixes many cues at once (batch ✦AI Fix), that would master N times.
+# This re-voices every requested cue's group (batched per voice = one model load
+# per voice) and reassembles+masters exactly once.
+
+def _run_redub_cues(job_id: str, req: "RedubCuesRequest"):
+    from tts.voice_profile import VoiceProfileManager
+    from speech import cps
+    import time
+    start_time = time.time()
+    db = Database(str(config.DB_PATH))
+    log_id = db.log_adhoc_start("redub_cues")
+
+    def _set(**kw):
+        with _adhoc_sync_jobs_lock:
+            if job_id in _adhoc_sync_jobs:
+                _adhoc_sync_jobs[job_id].update(kw)
+                db.log_adhoc_update(log_id, _adhoc_sync_jobs[job_id]["status"], _adhoc_sync_jobs[job_id]["log"], _adhoc_sync_jobs[job_id].get("error", ""))
+
+    def _log(msg, level="info"):
+        with _adhoc_sync_jobs_lock:
+            if job_id in _adhoc_sync_jobs:
+                _adhoc_sync_jobs[job_id]["log"].append({"timestamp": time.time(), "level": level, "message": msg})
+                db.log_adhoc_update(log_id, _adhoc_sync_jobs[job_id]["status"], _adhoc_sync_jobs[job_id]["log"], _adhoc_sync_jobs[job_id].get("error", ""))
+
+    try:
+        vpm = VoiceProfileManager(str(config.VOICES_DIR))
+        n = len(req.cues)
+        want = sorted({int(i) for i in req.indices if 0 <= int(i) < n})
+        if not want:
+            _set(status="failed", error="No valid cue indices"); return
+
+        work = Path(config.OUTPUT_DIR) / str(req.project_id) / "dub" / req.lang_code
+        work.mkdir(parents=True, exist_ok=True)
+        comf = cps.comfortable_cps(req.lang_code)
+        grouping = getattr(req, "group", True)
+
+        # Map each requested cue to its group (deterministic), deduped by head so a
+        # group touched by two selected members is only re-voiced once.
+        groups_all = _dub_groups(req.cues, req.voice) if grouping else [[i] for i in range(n)]
+        heads: dict = {}
+        for idx in want:
+            g = next((g for g in groups_all if idx in g), [idx])
+            heads[g[0]] = g
+
+        # Bucket the group heads by voice so each voice renders in ONE model load.
+        by_voice: dict = {}
+        for head, g in heads.items():
+            text = " ".join((req.cues[m].get("translated") or "").strip() for m in g).strip()
+            if not text:
+                continue
+            # Drop stale member clips + legacy split halves (words live in the head clip).
+            for m in g:
+                for stale in ([f"cue_{m:04d}_1.wav"] + ([f"cue_{m:04d}_0.wav"] if m != head else [])):
+                    p = work / stale
+                    if p.exists():
+                        try: p.unlink()
+                        except OSError: pass
+            voice_name = req.cues[head].get("voice") or req.voice
+            by_voice.setdefault(voice_name, []).append(
+                {"head": head, "text": text, "path": str(work / f"cue_{head:04d}_0.wav")})
+
+        if not by_voice:
+            _set(status="failed", error="Selected cues have no text to dub"); return
+
+        from tts import clip as _clip
+        done = 0
+        total = sum(len(v) for v in by_voice.values())
+        for voice_name, items in by_voice.items():
+            profile = vpm.load(voice_name)
+            if not profile:
+                _set(status="failed", error=f"Voice '{voice_name}' not found"); return
+            profile.language = req.lang_code
+            _set(message=f"Re-voicing {done + len(items)}/{total} cue(s)…")
+            ok = _clip.synth_clips(
+                profile, [it["text"] for it in items], [it["path"] for it in items],
+                warmups=[_clip.warmup_word()] * len(items),
+                save_stages=getattr(config, "DUB_SAVE_STAGES", False),
+                comf=comf, on_log=_log, timeout=1800)
+            if not ok:
+                _set(status="failed", error=f"Synthesis failed for voice {voice_name}."); return
+            done += len(items)
+
+        _set(message="Reassembling track…")
+        url = _assemble_project_dub(req.cues, work, _log, breathe=grouping)
+        if not url:
+            _set(status="failed", error="Reassembly failed"); return
+        audio_durs = _audio_durs_from_disk(req.cues, work, req.voice, grouping)
+        audio_keys = _archive_and_key(req.cues, work, req.voice, grouping, changed_heads=set(heads.keys()))
+        _set(status="done", message=f"Redubbed {total} cue(s)!", synced_audio_url=url, audio_durs=audio_durs, audio_keys=audio_keys)
+        _log(f"▶ Batch-redubbed {total} cue(s) in {time.time() - start_time:.1f}s.", "success")
+    except Exception as exc:
+        _set(status="failed", error=str(exc))
+        _log(f"Fatal error: {exc}", "error")
+    finally:
+        db.close()
+
+
+class RedubCuesRequest(BaseModel):
+    project_id: int
+    voice:      str
+    lang_code:  str = "French"
+    cues:       List[dict]      # all cues (for timing + reassembly)
+    indices:    List[int]       # which cues to re-voice
+    group:      bool = True     # False for recaps: re-voice each cue on its own
+
+
+@router.post("/speech/redub-cues", response_model=AdhocSyncJob)
+def redub_cues(req: RedubCuesRequest):
+    import uuid as _uuid
+    job_id = str(_uuid.uuid4())
+    with _adhoc_sync_jobs_lock:
+        _adhoc_sync_jobs[job_id] = {"job_id": job_id, "status": "running", "message": "Queued …",
+                                    "synced_audio_url": "", "log": [], "error": ""}
+    threading.Thread(target=_run_redub_cues, args=(job_id, req), daemon=True).start()
+    return AdhocSyncJob(**_adhoc_sync_jobs[job_id])
+
+
+# ── Restore audio (undo/redo of the actual generated audio) ───────────────────
+# The editor snapshots each cue's clip version key. To go back/forward in audio
+# history it sends the target snapshot's keys here: we copy each cue's archived
+# clip back into place from work/history/<key>.wav and reassemble the track. No
+# TTS runs — this is pure file restore + master, so it's fast.
+
+def _run_restore_audio(job_id: str, req: "RestoreAudioRequest"):
+    import shutil, time
+    start_time = time.time()
+    db = Database(str(config.DB_PATH))
+    log_id = db.log_adhoc_start("restore_audio")
+
+    def _set(**kw):
+        with _adhoc_sync_jobs_lock:
+            if job_id in _adhoc_sync_jobs:
+                _adhoc_sync_jobs[job_id].update(kw)
+                db.log_adhoc_update(log_id, _adhoc_sync_jobs[job_id]["status"], _adhoc_sync_jobs[job_id]["log"], _adhoc_sync_jobs[job_id].get("error", ""))
+
+    def _log(msg, level="info"):
+        with _adhoc_sync_jobs_lock:
+            if job_id in _adhoc_sync_jobs:
+                _adhoc_sync_jobs[job_id]["log"].append({"timestamp": time.time(), "level": level, "message": msg})
+                db.log_adhoc_update(log_id, _adhoc_sync_jobs[job_id]["status"], _adhoc_sync_jobs[job_id]["log"], _adhoc_sync_jobs[job_id].get("error", ""))
+
+    try:
+        work = Path(config.OUTPUT_DIR) / str(req.project_id) / "dub" / req.lang_code
+        hist = work / "history"
+        grouping = getattr(req, "group", True)
+        groups = _dub_groups(req.cues, req.voice) if grouping else [[i] for i in range(len(req.cues))]
+        keys = req.keys or []
+
+        restored = missing = 0
+        for g in groups:
+            head = g[0]
+            key = keys[head] if head < len(keys) else None
+            if not key:
+                continue
+            src = hist / f"{key}.wav"
+            if not src.exists():
+                missing += 1
+                continue
+            try:
+                shutil.copy2(src, work / f"cue_{head:04d}_0.wav")
+                restored += 1
+            except OSError:
+                missing += 1
+        if missing:
+            _log(f"{missing} clip version(s) were no longer in history — kept current audio for those.", "warning")
+
+        _set(message="Reassembling track…")
+        url = _assemble_project_dub(req.cues, work, _log, breathe=grouping)
+        if not url:
+            _set(status="failed", error="Reassembly failed"); return
+        audio_durs = _audio_durs_from_disk(req.cues, work, req.voice, grouping)
+        _set(status="done", message=f"Restored {restored} clip(s)", synced_audio_url=url, audio_durs=audio_durs)
+        _log(f"↺ Audio restored in {time.time() - start_time:.1f}s.", "success")
+    except Exception as exc:
+        _set(status="failed", error=str(exc))
+        _log(f"Fatal error: {exc}", "error")
+    finally:
+        db.close()
+
+
+class RestoreAudioRequest(BaseModel):
+    project_id: int
+    voice:      str
+    lang_code:  str = "French"
+    cues:       List[dict]              # target snapshot's cues (timing + grouping)
+    keys:       List[Optional[str]]     # per-cue clip version key to restore
+    group:      bool = True
+
+
+@router.post("/speech/restore-audio", response_model=AdhocSyncJob)
+def restore_audio(req: RestoreAudioRequest):
+    import uuid as _uuid
+    job_id = str(_uuid.uuid4())
+    with _adhoc_sync_jobs_lock:
+        _adhoc_sync_jobs[job_id] = {"job_id": job_id, "status": "running", "message": "Queued …",
+                                    "synced_audio_url": "", "log": [], "error": ""}
+    threading.Thread(target=_run_restore_audio, args=(job_id, req), daemon=True).start()
     return AdhocSyncJob(**_adhoc_sync_jobs[job_id])
 
 

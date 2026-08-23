@@ -33,10 +33,11 @@ export default function Logs() {
     finally { if (!silent) setLoading(false) }
   }, [])
 
-  // Load on open + auto-refresh every 4s so new runs/actions appear live.
+  // Load on open + auto-refresh every 1.5s so running stages stream their log
+  // lines in near real time (each line is flushed to the DB as it happens).
   useEffect(() => {
     load(); clearUnread()
-    const id = setInterval(() => load(true), 4000)
+    const id = setInterval(() => load(true), 1500)
     return () => clearInterval(id)
   }, [load, clearUnread])
 

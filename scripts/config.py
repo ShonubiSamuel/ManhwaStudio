@@ -283,9 +283,9 @@ def engine_for_language(code: str) -> str:
 # Comfortable spoken narration ≈ 150 wpm ≈ 15 CPS (Netflix reads at ≤17). CJK is
 # information-dense, so ≈9-10 CPS. These drive translation length + the "rushed"
 # flag per cue. CJK = Chinese / Japanese / Korean / Cantonese.
-CPS_COMFORTABLE     = 16.0   # the BEST-FIT target — translations aim for this so the
+CPS_COMFORTABLE     = 20.0   # the BEST-FIT target — translations aim for this so the
                              # dub fills its slot WITHOUT speed-up and WITHOUT silence
-CPS_MAX             = 20.0   # above this a cue is "rushed" and gets shortened
+CPS_MAX             = 24.0   # above this a cue is "rushed" and gets shortened
 # Time-compression is what sounds robotic when overdone. Cap it HARD for speech:
 # a clip is sped up at most this much; beyond that we'd rather it ride slightly
 # into the pause than break the voice. Good translations keep this near 1.0×.
@@ -294,6 +294,10 @@ CPS_MAX             = 20.0   # above this a cue is "rushed" and gets shortened
 # down — dragging a short line to fill silence sounds artificial; we leave the
 # pause instead (natural speed + real pauses, like professional dubs).
 DUB_SPEECH_MAX_STRETCH = 1.3
+# Which time-stretcher compresses over-long cues: "rubberband" (pyrubberband) or
+# "signalsmith" (python-stretch). A/B them to compare artefact quality on the
+# sped-up cues.
+DUB_STRETCHER = "signalsmith"
 # Clean gap (seconds) kept between one cue's end and the next cue's start, so a
 # line can never bleed onto the next (overlap = two voices = a "broken" sound).
 # 0.24s ≈ a natural breath — 0.06s made the next line "pick up" shockingly fast.
@@ -314,9 +318,8 @@ DUB_GROUP_MAX_CHARS = 280    # cap joined text length per generation
 # ── Breathing room (reduce long silences WITHOUT stretching the speech) ───────
 # A line shorter than its slot leaves dead air. Instead of slowing the voice
 # (which sounds dragged) we LENGTHEN the natural pauses BETWEEN its phrases so it
-# breathes across the slot — the spoken words are never touched. Each pause is
-# capped so it never sounds like the narrator froze; whatever can't be filled
-# naturally stays as a (capped) tail pause.
+# breathes across the slot — the spoken words are never touched. (Recaps override
+# this OFF per-request so each panel keeps a real pause of silence after it.)
 DUB_BREATHE_ENABLE     = True
 DUB_BREATHE_FILL_RATIO = 0.85   # spread the line to fill up to this much of its slot
 DUB_BREATHE_MAX_PAUSE  = 0.4    # never let a single internal pause exceed this (s)
@@ -333,7 +336,15 @@ DUB_BREATHE_MAX_PAUSE  = 0.4    # never let a single internal pause exceed this 
 DUB_WARMUP_PER_CUE = True
 DUB_WARMUP_WORD    = "Bon."
 
-DUB_MASTER_ENABLE       = True
+# Debug audit trail: for every generated cue clip, also keep a snapshot at each
+# processing stage — cue_NNNN_raw.wav (untouched model output) and
+# cue_NNNN_clean.wav (after trim/cleanup) — next to synced_raw.wav (after
+# assembly) and synced_final.wav (after mastering). Lets you A/B where quality is
+# lost. Set False to stop writing the extra files.
+DUB_SAVE_STAGES    = True
+
+DUB_MASTER_ENABLE       = False   # bypass the broadcast master (EQ+compression+loudnorm) —
+                                  # dub then matches the warmer, un-processed Voices "Test Voice"
 DUB_MASTER_LUFS         = -16.0    # dialogue loudness target (online/streaming)
 DUB_MASTER_TP           = -1.5     # true-peak ceiling (dBTP) — keeps headroom
 DUB_MASTER_SR           = 48000    # output sample rate (removes 24 kHz ceiling)
@@ -343,8 +354,8 @@ DUB_MASTER_MUD_CUT_DB   = -2.0     # cut boxy low-mids around 300 Hz
 DUB_MASTER_PRESENCE_DB  = 5.0      # boost ~3 kHz for consonant clarity
 DUB_MASTER_CLARITY_DB   = 2.5      # boost ~5 kHz for definition
 DUB_MASTER_AIR_DB       = 3.0      # gentle high shelf for air
-CPS_COMFORTABLE_CJK = 9.0
-CPS_MAX_CJK         = 13.0
+CPS_COMFORTABLE_CJK = 6.0
+CPS_MAX_CJK         = 10.0
 
 # Cue segmentation from word-level timestamps.
 CUE_WHISPER_MODEL = "small"   # Whisper model for cue segmentation — "small" is

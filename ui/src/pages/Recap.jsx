@@ -3,19 +3,21 @@
  *
  * PDF-sourced recaps: create a project from a manga/manhwa PDF, stack up crops
  * chapter by chapter (they stay visible, numbered), send them in small batches
- * to the vision model (GitHub Models GPT-4.1 by default) → each crop becomes a
+ * to the NVIDIA vision model (Kimi K2.6 by default) → each crop becomes a
  * cue with its panel attached and an AI narration line. From there it's the
  * same shared editor as Voiceover/Video Refine: AI Refine → English dub (the
  * timeline baseline) → add languages → translate → dub.
  */
 
-import { useState, useEffect } from "react"
+import { useRef, useState } from "react"
 import { useApp, actions, PAGES } from "../store/app"
 import { useNotify } from "../store/notify"
-import { listRefineProjects, createRefineProject } from "../api/videoRefine"
+import { createRefineProject } from "../api/videoRefine"
+import { importPdf } from "../api/media"
 import { colors, fonts, radius } from "../theme"
 import Button from "../components/Button"
 import { ProjectDubStudio } from "./DubStudio"
+import RefineProjectList from "./RefineProjectList"
 
 export default function Recap() {
   const { state, dispatch } = useApp()
@@ -29,43 +31,17 @@ export default function Recap() {
 }
 
 function RecapHome({ onOpen }) {
-  const { notify } = useNotify()
-  const [projects, setProjects] = useState(null)
-  const [showNew, setShowNew] = useState(false)
-
-  useEffect(() => {
-    listRefineProjects("recap")
-      .then(setProjects)
-      .catch((e) => { notify({ severity: "error", message: e.message }); setProjects([]) })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
-
   return (
-    <div style={{ flex: 1, overflowY: "auto", background: colors.bg, padding: "26px 28px" }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", maxWidth: 760 }}>
-        <div>
-          <h1 style={{ color: colors.text, fontSize: 26, fontWeight: fonts.bold }}>Recap Automation</h1>
-          <p style={{ color: colors.muted, fontSize: fonts.sm, marginTop: 4 }}>
-            PDF in → crop the panels → AI narrates each crop into a cue → refine, dub, translate.
-          </p>
-        </div>
-        <Button variant="primary" onClick={() => setShowNew(true)} style={{ borderRadius: radius.full, padding: "10px 18px", fontWeight: fonts.bold }}>+ New Recap</Button>
-      </div>
-      <div style={{ border: `1px solid ${colors.border}`, borderRadius: radius.lg, overflow: "hidden", background: colors.panel, maxWidth: 760, marginTop: 18 }}>
-        {projects === null ? (
-          <div style={{ padding: 40, textAlign: "center", color: colors.muted }}>Loading…</div>
-        ) : projects.length === 0 ? (
-          <div style={{ padding: 40, textAlign: "center", color: colors.muted }}>No recaps yet — click “New Recap”.</div>
-        ) : projects.map((p) => (
-          <button key={p.id} onClick={() => onOpen(p.id)}
-            style={{ display: "flex", width: "100%", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", borderBottom: `1px solid ${colors.border}`, background: "transparent", color: colors.text, textAlign: "left" }}>
-            <span style={{ display: "flex", alignItems: "center", gap: 10 }}><span>🪄</span><span style={{ fontWeight: fonts.medium }}>{p.title}</span></span>
-            <span style={{ color: colors.muted, fontSize: fonts.sm }}>{p.cue_count || 0} cues ›</span>
-          </button>
-        ))}
-      </div>
-      {showNew && <NewRecapModal onClose={() => setShowNew(false)} onCreated={(id) => { setShowNew(false); onOpen(id) }} />}
-    </div>
+    <RefineProjectList
+      kind="recap"
+      icon="🪄"
+      title="Recap Automation"
+      subtitle="PDF in → crop the panels → AI narrates each crop into a cue → refine, dub, translate."
+      newLabel="+ New Recap"
+      emptyText="No recaps yet — click “New Recap”."
+      onOpen={onOpen}
+      renderNewModal={({ onClose, onCreated }) => <NewRecapModal onClose={onClose} onCreated={onCreated} />}
+    />
   )
 }
 
@@ -74,17 +50,28 @@ function NewRecapModal({ onClose, onCreated }) {
   const [name, setName] = useState("")
   const [pdfPath, setPdfPath] = useState("")
   const [busy, setBusy] = useState(false)
+  const fileInputRef = useRef(null)
 
   const pick = async () => {
     try {
       if (window.pywebview?.api?.pick_file) {
         const p = await window.pywebview.api.pick_file(["PDF (*.pdf)"])
         if (p) { setPdfPath(p); if (!name) setName((p.split(/[\\/]/).pop() || "").replace(/\.[^.]+$/, "")) }
-      } else {
-        const p = window.prompt("Absolute path to the manga PDF:")
-        if (p) setPdfPath(p.trim())
-      }
+      } else fileInputRef.current?.click()
     } catch (e) { notify({ severity: "error", message: e.message }) }
+  }
+
+  const importSelectedPdf = async (e) => {
+    const file = e.target.files?.[0]
+    e.target.value = ""
+    if (!file) return
+    setBusy(true)
+    try {
+      const imported = await importPdf(file)
+      setPdfPath(imported.path)
+      if (!name) setName(imported.filename.replace(/\.[^.]+$/, ""))
+    } catch (err) { notify({ severity: "error", message: err.message }) }
+    finally { setBusy(false) }
   }
 
   const create = async () => {
@@ -110,6 +97,7 @@ function NewRecapModal({ onClose, onCreated }) {
         <label style={{ display: "block", color: colors.textDim, fontSize: fonts.sm, marginBottom: 6 }}>Manga PDF</label>
         <div style={{ display: "flex", gap: 8, marginBottom: 18 }}>
           <Button variant="secondary" onClick={pick}>Choose PDF</Button>
+          <input ref={fileInputRef} type="file" accept="application/pdf,.pdf" onChange={importSelectedPdf} style={{ display: "none" }} />
           <input value={pdfPath} onChange={(e) => setPdfPath(e.target.value)} placeholder="/absolute/path/to/chapter.pdf"
             style={{ flex: 1, background: colors.panel2, border: `1px solid ${colors.border}`, color: colors.text, padding: "9px 12px", borderRadius: radius.md }} />
         </div>

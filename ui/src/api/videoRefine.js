@@ -3,7 +3,7 @@
  * (scripts/api/routers/video_refine.py). Separate from the audio/dub system.
  */
 
-import { get, post, put } from "./client"
+import { get, post, put, patch, del } from "./client"
 
 /** List projects of one kind: "video_refine" (default) or "recap". */
 export function listRefineProjects(kind = "video_refine") {
@@ -16,9 +16,16 @@ export function createRefineProject(name, sourcePath = "", kind = "video_refine"
 }
 
 /** Narrate ONE batch of cropped panels via the stateful storytelling pipeline.
- *  images: [{index, data(dataURL)}] · returns {lines:[{index,text}], registry, memory} */
-export function narratePanels(projectId, prompt, images, resetMemory = false) {
-  return post("/video-refine/narrate", { project_id: projectId, prompt, images, reset_memory: resetMemory })
+ *  images: [{index, data(dataURL)}] · returns {lines:[{index,text}], memory} */
+export function narratePanels(projectId, prompt, images, resetMemory = false, useMagi = false) {
+  return post("/video-refine/narrate", { project_id: projectId, prompt, images, reset_memory: resetMemory, use_magi: useMagi })
+}
+
+/** Narrate ALL cropped panels in one whole-chapter pass (vision chunked → read
+ *  everything → windowed narration with hindsight). images: [{index, data(dataURL)}].
+ *  Returns {lines:[{index,text}], memory}. Watch the Logs page for live progress. */
+export function narrateAll(projectId, prompt, images, resetMemory = false, useMagi = false) {
+  return post("/video-refine/narrate-all", { project_id: projectId, prompt, images, reset_memory: resetMemory, use_magi: useMagi })
 }
 
 /** How narration will batch given the current model settings.
@@ -27,14 +34,46 @@ export function getNarratePlan() {
   return get("/video-refine/narrate-plan")
 }
 
-/** The living character registry + rolling story memory + cast seed. */
+/** Legacy-compatible recap profile (cast seed + rolling summary). */
 export function getRecapState(projectId) {
   return get(`/video-refine/recap-state/${projectId}`)
 }
 
-/** Persist user edits to the registry / cast seed / memory. */
+/** Persist authored cast context / rolling summary. */
 export function saveRecapState(projectId, state) {
   return put(`/video-refine/recap-state/${projectId}`, state)
+}
+
+/** Evidence-backed character/event ledger used by the recap writer. */
+export function getStoryMemory(projectId) {
+  return get(`/video-refine/story-memory/${projectId}`)
+}
+
+/** A human correction becomes canonical context for future recaps. */
+export function updateStoryCharacter(projectId, stableId, changes) {
+  return patch(`/video-refine/story-memory/${projectId}/characters/${encodeURIComponent(stableId)}`, changes)
+}
+
+export function deleteStoryCharacter(projectId, stableId) {
+  return del(`/video-refine/story-memory/${projectId}/characters/${encodeURIComponent(stableId)}`)
+}
+
+export function undoStoryMemory(projectId) {
+  return post(`/video-refine/story-memory/${projectId}/undo`, {})
+}
+
+export function redoStoryMemory(projectId) {
+  return post(`/video-refine/story-memory/${projectId}/redo`, {})
+}
+
+/** Local official Magi v3 checkpoint availability. It is never downloaded by GET. */
+export function getMagiStatus() {
+  return get("/video-refine/magi/status")
+}
+
+/** Explicitly install Magi v3 for local visual grounding. */
+export function installMagi() {
+  return post("/video-refine/magi/install", {})
 }
 
 /** Render a PDF to page images for the crop tool. @returns {count, pages:[{index,url,w,h}]} */

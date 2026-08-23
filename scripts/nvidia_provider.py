@@ -65,13 +65,18 @@ def call_text(
 
     from openai import OpenAI
 
+    import httpx
+    import httpx
     client = OpenAI(
         base_url    = config.NVIDIA_BASE_URL,
         api_key     = api_key,
-        max_retries = 3,
-        timeout     = 60.0,   # fail a hung/dropped stream fast instead of waiting forever
+        # Granular timeout: connection problems still fail fast, but REASONING
+        # models (glm, deepseek-r1, …) think silently for minutes before the first
+        # streamed token — a short read timeout kills every attempt mid-thought
+        # ("Request timed out" ×3). Give the stream a long read window instead.
+        timeout     = httpx.Timeout(connect=15.0, read=420.0, write=60.0, pool=15.0),
     )
-    
+
     try:
         completion = client.chat.completions.create(
             model       = model,
@@ -118,10 +123,13 @@ def call_vision(
 
     from openai import OpenAI
 
+    import httpx
     client = OpenAI(
         base_url    = config.NVIDIA_BASE_URL,
         api_key     = api_key,
-        max_retries = 3,
+        # Never leave a vision request silently open for many minutes.
+        max_retries = 0,
+        timeout     = httpx.Timeout(connect=15.0, read=90.0, write=60.0, pool=15.0),
     )
     content = []
     for mime, b64 in images_b64:

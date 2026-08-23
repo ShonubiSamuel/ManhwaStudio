@@ -15,6 +15,7 @@ Endpoints
   PATCH  /api/voices/{name}      update a profile
   DELETE /api/voices/{name}      delete a profile
   POST   /api/tts/quick          start a Quick-TTS sample job
+  POST   /api/tts/render         render a free-form passage into a downloadable WAV
   GET    /api/tts/quick/{job}    poll a Quick-TTS job
 """
 
@@ -32,7 +33,7 @@ from api.deps import get_db
 from database import Database
 from api.models import (
     VoiceProfileDetail, VoiceProfileUpsert, VoiceReferenceRequest,
-    QuickTTSRequest, VoiceDesignRequest, AdhocDubRequest, QuickTTSJob, OkResponse,
+    QuickTTSRequest, TTSRenderRequest, VoiceDesignRequest, QuickTTSJob, OkResponse,
 )
 from tts.voice_profile import VoiceProfile, VoiceProfileManager
 import config
@@ -76,6 +77,20 @@ def get_voice(name: str):
     if not p:
         raise HTTPException(404, f"Voice profile '{name}' not found")
     return _to_detail(p)
+
+
+@router.get("/voices/{name}/reference-audio")
+def voice_reference_audio(name: str):
+    """Stream a voice profile's stored reference clip so the UI can preview it
+    (the audio used to CREATE the voice). 404 if the voice has no reference."""
+    from fastapi.responses import FileResponse
+    p = _vpm().load(name)
+    ref = (getattr(p, "ref_wav_path", "") if p else "") or ""
+    path = Path(ref) if ref else (Path(config.VOICE_REF_DIR) / f"{name}.wav")
+    if not path.is_file():
+        raise HTTPException(404, f"No reference audio for voice '{name}'")
+    return FileResponse(str(path), media_type="audio/wav",
+                        headers={"Cache-Control": "no-cache"})
 
 
 @router.post("/voices", response_model=VoiceProfileDetail, status_code=201)
@@ -193,6 +208,15 @@ def set_voice_reference(name: str, body: VoiceReferenceRequest, db: Database = D
         raise HTTPException(500, "Couldn't convert the reference clip to WAV (is ffmpeg installed?)")
 
     p.mode         = "VoiceClone"
+    # A clone voice needs a clone-capable "-Base" model. The default is
+    # "1.7B-CustomVoice", which does NOT support create_voice_clone_prompt — so
+    # switch to the recommended clone model unless the user already picked a Base.
+    if not (p.model or "").endswith("-Base"):
+        p.model = config.TTS_RECOMMENDED_MODELS.get("VoiceClone", "1.7B-Base")
+    # Clear the CustomVoice preset speaker left over from the default profile — a
+    # clone is driven by the reference clip, not a speaker ID, and a lingering
+    # "Aiden" would show a misleading Speaker ID in the UI.
+    p.speaker      = ""
     p.ref_wav_path = str(dst)
     
     start = time.time()
@@ -268,6 +292,13 @@ def _samples_dir() -> Path:
     return d
 
 
+def _renders_dir() -> Path:
+    """Standalone TTS exports.  Each render gets its own file, unlike a preview."""
+    d = Path(config.OUTPUT_DIR) / "tts_renders"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _start_job(target, *args, name: str) -> str:
     job_id = uuid.uuid4().hex[:12]
     with _jobs_lock:
@@ -287,8 +318,9 @@ def _dub_read_dir(project_id: int, lang_code: str | None) -> Path:
 
 
 def _run_quick_tts(job_id: str, text: str, voice: str, language: str | None,
-                   project_id: int | None = None, lang_code: str | None = None) -> None:
-    from tts import synth
+                   project_id: int | None = None, lang_code: str | None = None,
+                   output_path: str | None = None) -> None:
+    from tts import clip as _clip
     db = Database(str(config.DB_PATH))
     log_id = db.log_adhoc_start("quick_tts", project_name=f"Voice Test: {voice}")
     
@@ -314,29 +346,40 @@ def _run_quick_tts(job_id: str, text: str, voice: str, language: str | None,
             return
         if language:
             profile.language = language
-        if project_id is not None:
+        if output_path:
+            out = Path(output_path)
+        elif project_id is not None:
             out = _dub_read_dir(project_id, lang_code) / "tts_read.wav"
         else:
-            out = _samples_dir() / f"{job_id}.wav"
+            # Voice test → a STABLE per-voice path (not the ephemeral job id), so
+            # the sample is reusable: the Add-Language preview replays this instead
+            # of regenerating. Latest test wins.
+            out = _samples_dir() / f"{(voice or 'sample').replace('/', '_').replace(chr(92), '_')}.wav"
             
         msg = "Loading model & generating …"
         _job_set(job_id, message=msg)
         _log("running", msg)
-        
-        script = synth.build_synth_script(profile=profile, sentences=[text], output_paths=[str(out)], skip_indices=set())
-        r = subprocess.run([synth.synth_python(profile), "-c", script], capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=600, env=synth.synth_env(profile))
-                           
-        raw_logs = _parse_logs(r.stdout, "info") + _parse_logs(r.stderr, "warning")
-        
-        if "DONE:0" in (r.stdout or "") and out.exists():
+
+        # EXACT same pipeline as the dub: speakable() normalisation, then a
+        # sentence-batched synth where every clip gets the warm-up 'running start'
+        # + hum/onset/silence/level cleanup, concatenated into one sample. Short
+        # text → a single clip; long text batches automatically.
+        run_logs: list = []
+        ok = _clip.synth_text(
+            profile, text, str(out),
+            warmup=_clip.warmup_word(),
+            comf=_clip.comfortable_cps(profile.language),
+            on_log=lambda m, lvl="info": run_logs.append({"timestamp": time.time(), "level": lvl, "message": m}),
+            timeout=1800,
+        )
+        if ok and out.exists():
             msg = "Sample ready"
             _job_set(job_id, status="done", message=msg, audio_url=_files_url(out), path=str(out))
-            _log("done", msg, extra_logs=raw_logs)
+            _log("done", msg, extra_logs=run_logs)
         else:
-            err = "Synthesis failed.\n" + (r.stderr or "")[-600:]
+            err = "Synthesis failed."
             _job_set(job_id, status="failed", error=err)
-            _log("failed", "Synthesis failed", err, extra_logs=raw_logs)
+            _log("failed", "Synthesis failed", err, extra_logs=run_logs)
     except Exception as exc:
         _job_set(job_id, status="failed", error=str(exc))
         _log("failed", "An exception occurred", str(exc))
@@ -396,72 +439,6 @@ def _run_voice_design(job_id: str, instruct: str, text: str, language: str) -> N
         db.close()
 
 
-def _run_adhoc_dub(job_id: str, text: str, voice: str, language: str | None) -> None:
-    from tts import synth
-    from core.audio_utils import concat_wavs
-    db = Database(str(config.DB_PATH))
-    log_id = db.log_adhoc_start("adhoc_dub", project_name=f"Adhoc Dub: {voice}")
-    
-    def _parse_logs(text: str, default_lvl: str):
-        out = []
-        for ln in (text or "").splitlines():
-            ln = ln.strip()
-            if ln: out.append({"timestamp": time.time(), "level": default_lvl, "message": ln})
-        return out
-    
-    def _log(status: str, msg: str, error: str = "", extra_logs=None):
-        level = "error" if error else ("success" if status == "done" else "info")
-        logs = [{"timestamp": time.time(), "level": level, "message": msg}]
-        if extra_logs: logs.extend(extra_logs)
-        db.log_adhoc_update(log_id, status, logs, error)
-
-    try:
-        profile = _vpm().load(voice)
-        if not profile:
-            msg = f"Voice '{voice}' not found"
-            _job_set(job_id, status="failed", error=msg)
-            _log("failed", msg, msg)
-            return
-        if language:
-            profile.language = language
-        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-        if not lines:
-            msg = "No lines to dub"
-            _job_set(job_id, status="failed", error=msg)
-            _log("failed", msg, msg)
-            return
-        d = _samples_dir() / job_id; d.mkdir(parents=True, exist_ok=True)
-        outs = [str(d / f"{i:03d}.wav") for i in range(len(lines))]
-        
-        msg = f"Dubbing {len(lines)} line(s) …"
-        _job_set(job_id, message=msg)
-        _log("running", msg)
-        
-        script = synth.build_synth_script(profile=profile, sentences=lines, output_paths=outs, skip_indices=set())
-        r = subprocess.run([synth.synth_python(profile), "-c", script], capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", timeout=1800, env=synth.synth_env(profile))
-                       
-        raw_logs = _parse_logs(r.stdout, "info") + _parse_logs(r.stderr, "warning")
-        
-        produced = [o for o in outs if Path(o).exists()]
-        if not produced:
-            err = "Dubbing produced no audio (check the TTS engine setup)."
-            _job_set(job_id, status="failed", error=err)
-            _log("failed", "Dubbing failed", err, extra_logs=raw_logs)
-            return
-        combined = _samples_dir() / f"{job_id}.wav"
-        concat_wavs(produced, str(combined))
-        
-        msg = f"Dubbed {len(produced)}/{len(lines)} line(s)"
-        _job_set(job_id, status="done", message=msg, audio_url=_files_url(combined), path=str(combined))
-        _log("done", msg, extra_logs=raw_logs)
-    except Exception as exc:
-        _job_set(job_id, status="failed", error=str(exc))
-        _log("failed", "An exception occurred", str(exc))
-    finally:
-        db.close()
-
-
 @router.post("/tts/quick", response_model=QuickTTSJob, status_code=202)
 def quick_tts(body: QuickTTSRequest):
     if not (body.text or "").strip():
@@ -473,21 +450,39 @@ def quick_tts(body: QuickTTSRequest):
     return QuickTTSJob(**_jobs[job_id])
 
 
+@router.post("/tts/render", response_model=QuickTTSJob, status_code=202)
+def render_tts(body: TTSRenderRequest):
+    """Render a passage from the TTS page without overwriting a voice preview.
+
+    The worker deliberately remains ``_run_quick_tts``: it uses ``clip.synth_text``
+    and therefore retains the dub system's sentence splitting, warm-up run,
+    onset/hum cleanup, level matching, and final WAV concatenation.
+    """
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(400, "Text is required")
+    if not _vpm().exists(body.voice):
+        raise HTTPException(404, f"Voice '{body.voice}' not found")
+    # A job-id-named output lets several long renders finish independently.
+    job_id = uuid.uuid4().hex[:12]
+    out = _renders_dir() / f"tts_{job_id}.wav"
+    with _jobs_lock:
+        _jobs[job_id] = {"job_id": job_id, "status": "running", "message": "Queued …",
+                         "audio_url": "", "path": "", "error": ""}
+    threading.Thread(
+        target=_run_quick_tts,
+        args=(job_id, text, body.voice, body.language, None, None, str(out)),
+        daemon=True,
+        name=f"ttsrender-{job_id}",
+    ).start()
+    return QuickTTSJob(**_jobs[job_id])
+
+
 @router.post("/voices/design", response_model=QuickTTSJob, status_code=202)
 def design_voice(body: VoiceDesignRequest):
     if not (body.text or "").strip():
         raise HTTPException(400, "Sample text is required")
     job_id = _start_job(_run_voice_design, body.instruct or "", body.text.strip(), body.language, name="design")
-    return QuickTTSJob(**_jobs[job_id])
-
-
-@router.post("/tts/dub-adhoc", response_model=QuickTTSJob, status_code=202)
-def dub_adhoc(body: AdhocDubRequest):
-    if not (body.text or "").strip():
-        raise HTTPException(400, "Text is required")
-    if not _vpm().exists(body.voice):
-        raise HTTPException(404, f"Voice '{body.voice}' not found")
-    job_id = _start_job(_run_adhoc_dub, body.text, body.voice, body.language, name="adhoc")
     return QuickTTSJob(**_jobs[job_id])
 
 

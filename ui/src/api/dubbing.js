@@ -71,21 +71,7 @@ export function getDubBatches(episodeId, lang) {
   return get(`/dub/batches/${episodeId}?lang=${lang}`)
 }
 
-/** Regenerate one dub batch in the background (202 — watch via the pipeline SSE). */
-export function regenerateDubBatch(episodeId, lang, batchIdx) {
-  return post(`/dub/regenerate-batch/${episodeId}`, { lang, batch_idx: batchIdx })
-}
-
 /** Reset a language's dub state so the next dub run regenerates it from scratch. */
 export function resetDubLanguage(episodeId, lang) {
   return post(`/dub/reset/${episodeId}?lang=${lang}`, {})
-}
-
-/**
- * Fix "rushed" panels: re-translate shorter → re-dub → re-sync, best of 3.
- * Pass panelIndices to fix specific panels, or null to fix all rushed ones.
- * 202 — watch progress via the pipeline SSE.
- */
-export function fixDubPanels(episodeId, lang, panelIndices) {
-  return post(`/dub/fix/${episodeId}`, { lang, panel_indices: panelIndices || null })
 }

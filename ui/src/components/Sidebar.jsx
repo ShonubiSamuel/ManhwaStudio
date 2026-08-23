@@ -20,6 +20,7 @@ const NAV = [
   { page: PAGES.RECAP,         label: "Recap",         icon: "🪄" },
   { page: PAGES.REALTIME,      label: "Real-Time",     icon: "◉" },
   { page: PAGES.VOICES,        label: "Voices",        icon: "♪" },
+  { page: PAGES.TTS,           label: "Text to Speech", icon: "♬" },
   { page: PAGES.SETTINGS,      label: "Settings",      icon: "⚙" },
   { page: PAGES.LOGS,          label: "Logs",          icon: "≡" },
 ]

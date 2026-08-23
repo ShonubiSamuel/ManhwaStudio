@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
+import base64
 from pathlib import Path
 from typing import List, Optional
 
@@ -105,6 +106,9 @@ def create_refine_project(body: RefineProjectCreate, db: Database = Depends(get_
     name = (body.name or "").strip() or "Untitled refine"
     kind = body.kind if body.kind in ("video_refine", "recap") else "video_refine"
     pid = db.add_project(name)
+    # add_project may auto-suffix a duplicate name ("Foo (2)") to keep projects
+    # distinct — report the ACTUAL stored title so the UI matches the DB.
+    name = (db.get_project(pid) or {}).get("name") or name
     # Tag the kind so each section lists only its own projects.
     db.set_setting(_kind_key(pid), kind)
     # Seed the DUB session (both sections use the Voiceover editor).
@@ -119,7 +123,7 @@ def create_refine_project(body: RefineProjectCreate, db: Database = Depends(get_
     return {"id": pid, "title": name, "cue_count": 0, "source_path": body.source_path}
 
 
-# ── Recap state (character registry + rolling story memory), per project ──────
+# ── Recap profile + legacy compatibility, per project ─────────────────────────
 
 def _recap_state_path(pid: int) -> Path:
     return _project_dir(pid) / "recap_state.json"
@@ -146,13 +150,13 @@ def _save_recap_state(pid: int, state: dict) -> None:
 
 @router.get("/recap-state/{project_id}")
 def get_recap_state(project_id: int, db: Database = Depends(get_db)):
-    """The living character registry + rolling story memory + cast seed."""
+    """Legacy-compatible recap profile (authored cast seed + rolling summary)."""
     return _load_recap_state(project_id)
 
 
 @router.put("/recap-state/{project_id}")
 def put_recap_state(project_id: int, body: dict, db: Database = Depends(get_db)):
-    """Persist user edits to the registry / cast seed / memory (human safety net)."""
+    """Persist authored cast context and the rolling recap summary."""
     if not db.get_project(project_id):
         raise HTTPException(404, f"Project {project_id} not found")
     state = _load_recap_state(project_id)
@@ -163,6 +167,83 @@ def put_recap_state(project_id: int, body: dict, db: Database = Depends(get_db))
     return {"ok": True}
 
 
+@router.get("/story-memory/{project_id}")
+def get_story_memory(project_id: int, db: Database = Depends(get_db)):
+    """Reviewable canonical memory.  Every entity/event retains panel evidence."""
+    if not db.get_project(project_id):
+        raise HTTPException(404, f"Project {project_id} not found")
+    from ai import story_memory
+    # Existing manually maintained registry is imported lazily, so old projects
+    # gain structured memory without a destructive conversion step.
+    story_memory.sync_legacy_registry(db, project_id, _load_recap_state(project_id).get("registry", {}))
+    return story_memory.snapshot(db, project_id)
+
+
+@router.patch("/story-memory/{project_id}/characters/{stable_id}")
+def patch_story_character(project_id: int, stable_id: str, body: dict,
+                          db: Database = Depends(get_db)):
+    """Human corrections win over model output and feed every later retrieval."""
+    if not db.get_project(project_id):
+        raise HTTPException(404, f"Project {project_id} not found")
+    if not db.get_story_character(stable_id):
+        raise HTTPException(404, f"Character {stable_id} not found")
+    before = db.story_memory_snapshot_raw(project_id)
+    updated = db.update_story_character(project_id, stable_id, **body)
+    db.record_story_memory_history(project_id, "edit character", before, db.story_memory_snapshot_raw(project_id))
+    from ai import story_memory
+    return {"character": updated or {}, "memory": story_memory.snapshot(db, project_id)}
+
+
+@router.delete("/story-memory/{project_id}/characters/{stable_id}")
+def delete_story_character(project_id: int, stable_id: str, db: Database = Depends(get_db)):
+    if not db.get_project(project_id):
+        raise HTTPException(404, f"Project {project_id} not found")
+    character = db.get_story_character(stable_id)
+    if not character:
+        raise HTTPException(404, f"Character {stable_id} not found")
+    before = db.story_memory_snapshot_raw(project_id)
+    from ai import story_memory
+    story_memory.retire_character_labels(db, project_id, character)
+    db.delete_story_character(project_id, stable_id)
+    db.record_story_memory_history(project_id, "delete character", before, db.story_memory_snapshot_raw(project_id))
+    return story_memory.snapshot(db, project_id)
+
+
+@router.post("/story-memory/{project_id}/undo")
+def undo_story_memory(project_id: int, db: Database = Depends(get_db)):
+    if not db.get_project(project_id):
+        raise HTTPException(404, f"Project {project_id} not found")
+    db.story_memory_undo(project_id)
+    from ai import story_memory
+    return story_memory.snapshot(db, project_id)
+
+
+@router.post("/story-memory/{project_id}/redo")
+def redo_story_memory(project_id: int, db: Database = Depends(get_db)):
+    if not db.get_project(project_id):
+        raise HTTPException(404, f"Project {project_id} not found")
+    db.story_memory_redo(project_id)
+    from ai import story_memory
+    return story_memory.snapshot(db, project_id)
+
+
+@router.get("/magi/status")
+def magi_status():
+    """Read-only local Magi v3 availability. Does not load or download a model."""
+    from ai import magi
+    return magi.status()
+
+
+@router.post("/magi/install")
+def install_magi():
+    """Install the official Magi v3 checkpoint when the user requests it."""
+    from ai import magi
+    try:
+        return magi.install()
+    except Exception as exc:
+        raise HTTPException(500, f"Could not install Magi v3: {exc}")
+
+
 def _model_for_provider(db: Database, provider: str, kind: str) -> str:
     """The model id a provider uses for a task. kind: 'translate'|'refine'|'narrate'
     (narrate = the vision model)."""
@@ -170,8 +251,8 @@ def _model_for_provider(db: Database, provider: str, kind: str) -> str:
         if kind == "narrate":
             return db.get_setting("nvidia_vision_model", "") or config.NVIDIA_VISION_MODEL
         return db.get_setting(f"nvidia_{kind}_model", "") or config.NVIDIA_MODEL
-    if provider == "github":
-        return db.get_setting("github_model", "") or "openai/gpt-4o-mini"
+    if provider == "gemini":
+        return (db.get_setting("gemini_vision_model", "") or "gemini-3.5-flash-lite") if kind == "narrate" else ""
     if provider == "groq":
         return db.get_setting("groq_model", "") or ""
     if provider == "lm_studio":
@@ -185,7 +266,7 @@ def narrate_plan(db: Database = Depends(get_db)):
     UI uses effective_batch to slice crops so it auto-adapts to each model
     (a 1-image model drops to 1; a capable model honours your preference)."""
     from ai import model_caps
-    vprovider = db.get_setting("ai_provider_narrate", "github")
+    vprovider = db.get_setting("ai_provider_narrate", "nvidia")
     tprovider = db.get_setting("ai_provider_refine", "nvidia")
     vmodel = _model_for_provider(db, vprovider, "narrate")
     rmodel = _model_for_provider(db, tprovider, "refine")
@@ -207,7 +288,8 @@ class NarrateRequest(BaseModel):
     project_id:   int
     prompt:       str = ""          # narration style instructions
     images:       List[dict] = []   # [{index:int, data:str(b64 or data-url)}]
-    reset_memory: bool = False      # start a fresh chapter (keeps the registry)
+    reset_memory: bool = False      # start a fresh chapter (keeps confirmed memory)
+    use_magi:      bool = False     # opt-in local visual grounding
 
 
 @router.post("/narrate")
@@ -226,19 +308,25 @@ def narrate_panels(req: NarrateRequest, db: Database = Depends(get_db)):
     t0 = time.time()
     log_lines = []
 
+    # Create the log row up front and STREAM every line into it as it happens, so
+    # the Logs page shows real-time progress instead of one dump at the end.
+    log_id = db.log_adhoc_start("recap_narrate", "Recap")
+
     def _log(msg, level="info"):
         log_lines.append({"timestamp": time.time(), "level": level, "message": msg})
+        db.log_adhoc_update(log_id, "running", log_lines)
 
     def _finish(status, error=""):
-        db.log_adhoc_activity("recap_narrate", status, time.time() - t0, log_lines, error, "Recap")
+        db.log_adhoc_update(log_id, status, log_lines, error)
 
     if not req.images:
         _log("No images in batch", "error"); _finish("failed", "No images in batch")
         raise HTTPException(400, "No images in batch")
 
-    vprovider = db.get_setting("ai_provider_narrate", "github")   # VISION (call 1)
+    vprovider = db.get_setting("ai_provider_narrate", "nvidia")   # VISION (call 1)
     tprovider = db.get_setting("ai_provider_refine", "nvidia")    # TEXT reasoning (call 2)
     nvidia_key = db.get_setting("nvidia_api_key", "")
+    gemini_key = db.get_setting("gemini_api_key", "")
     vmodel = _model_for_provider(db, vprovider, "narrate")
     rmodel = _model_for_provider(db, tprovider, "refine")
     lm_model = db.get_setting("lm_studio_model", "")
@@ -248,7 +336,8 @@ def narrate_panels(req: NarrateRequest, db: Database = Depends(get_db)):
     b64s = [(img.get("data") or "").split(",", 1)[-1] for img in req.images]
     idxs = [int(img.get("index", i)) for i, img in enumerate(req.images)]
     style = (req.prompt or "").strip() or (
-        "Engaging, dramatic third-person recap narration, present tense, punchy and flowing.")
+        "Engaging, dramatic, CONCISE third-person recap narration — present tense, punchy, "
+        "one or two short sentences per beat, no filler.")
 
     # Defensive: never send more images than the vision model accepts.
     from ai import model_caps
@@ -264,13 +353,19 @@ def narrate_panels(req: NarrateRequest, db: Database = Depends(get_db)):
     state = _load_recap_state(req.project_id)
     if req.reset_memory:
         state["memory"] = ""
-        _log("story memory reset for a new chapter (registry kept)", "muted")
+        _log("story memory reset for a new chapter (confirmed memory kept)", "muted")
 
     _log(f"▶ Batch of {len(b64s)} panel(s) — vision {vmodel} ({vprovider}), story {rmodel} ({tprovider}, out≤{rmax})", "accent")
     try:
+        _log(f"vision: sending {len(b64s)} panel(s) to {vmodel} ({vprovider}) — analysing…", "muted")
         facts = recap_narrator.extract_facts(
-            b64s, vprovider, nvidia_key=nvidia_key, nvidia_vision_model=vmodel, log=_log)
+            b64s, vprovider, nvidia_key=nvidia_key, nvidia_vision_model=vmodel,
+            gemini_key=gemini_key, gemini_vision_model=vmodel, log=_log)
         _log(f"vision: extracted facts for {len(facts)} panel(s)", "muted")
+        if req.use_magi:
+            _add_magi_visual_evidence(b64s, facts, _log)
+            _log("Magi v3: attached character, text, tail and dialogue-link evidence", "muted")
+        _log(f"story: {rmodel} ({tprovider}) resolving identities & narrating {len(idxs)} panel(s) — this can take a while…", "muted")
         result = recap_narrator.narrate_batch(
             facts, idxs, style, state,
             provider=tprovider, nvidia_key=nvidia_key, lm_model=lm_model,
@@ -286,6 +381,189 @@ def narrate_panels(req: NarrateRequest, db: Database = Depends(get_db)):
     return {"lines": result["lines"],
             "registry": state.get("registry", {"characters": []}),
             "memory": state.get("memory", "")}
+
+
+# The vision provider rejects requests whose total payload exceeds ~25 MB. Cropped
+# panels arrive as full-res PNGs (often 4x-upscaled) — far more than a vision model
+# needs to READ a panel — so we downscale + recompress to JPEG before sending, and
+# also cap each chunk by cumulative bytes (not just image count) as a hard backstop.
+_VISION_MAX_DIM   = 1536          # px on the long side — keeps panel text legible
+_VISION_JPEG_Q    = 85
+_VISION_BYTE_CAP  = 22_000_000    # per-chunk base64 budget, under the 25 MB limit
+
+
+def _shrink_b64_for_vision(b64: str) -> str:
+    """Decode a panel, downscale to _VISION_MAX_DIM on the long side, re-encode as
+    JPEG. Falls back to the original string if anything goes wrong."""
+    import base64, io
+    from PIL import Image
+    try:
+        im = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+        w, h = im.size
+        if max(w, h) > _VISION_MAX_DIM:
+            scale = _VISION_MAX_DIM / float(max(w, h))
+            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=_VISION_JPEG_Q)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return b64
+
+
+def _add_magi_visual_evidence(b64s: list[str], facts: list[dict], log) -> None:
+    """Attach Magi v3 grounding to LLM facts without making it a fake ReID system.
+
+    Magi's character clusters and dialogue links are evidence within each source
+    image.  The later story-bible pass combines that evidence with dialogue,
+    user corrections and the canonical story ledger for cross-chapter identity.
+    """
+    from io import BytesIO
+    from PIL import Image
+    from ai import magi
+
+    if not magi.is_installed():
+        raise RuntimeError("Magi v3 is not installed. Install it from the Recap narration window, or turn off Magi visual grounding.")
+    images = []
+    for b64 in b64s:
+        try:
+            images.append(Image.open(BytesIO(base64.b64decode(b64))).convert("RGB"))
+        except Exception as exc:
+            raise RuntimeError(f"Could not prepare a panel for Magi v3: {exc}") from exc
+    # Four images keeps the 0.8B local model inside a comfortable MPS/CPU memory
+    # envelope while still preserving every panel's grounding data.
+    evidence = []
+    for start in range(0, len(images), 4):
+        end = min(len(images), start + 4)
+        log(f"Magi v3: grounding panel(s) {start + 1}–{end}…", "muted")
+        evidence.extend(magi.analyse(images[start:end]))
+    for fact, item in zip(facts, evidence):
+        if isinstance(fact, dict):
+            fact["magi_visual_evidence"] = item
+
+
+def _vision_chunks(b64s: list, idxs: list, vmax: int):
+    """Group panels into vision calls bounded by BOTH the model's image limit and
+    the provider's payload-size limit. Yields (chunk_b64s, chunk_idxs)."""
+    cur_b, cur_i, cur_bytes = [], [], 0
+    for b, ix in zip(b64s, idxs):
+        sz = len(b)
+        if cur_b and (len(cur_b) >= vmax or cur_bytes + sz > _VISION_BYTE_CAP):
+            yield cur_b, cur_i
+            cur_b, cur_i, cur_bytes = [], [], 0
+        cur_b.append(b); cur_i.append(ix); cur_bytes += sz
+    if cur_b:
+        yield cur_b, cur_i
+
+
+@router.post("/narrate-all")
+def narrate_all_panels(req: NarrateRequest, db: Database = Depends(get_db)):
+    """WHOLE-CHAPTER narration — the identity-aware pipeline (see recap_narrator):
+
+        Phase 1  VISION (chunked)   → rich per-panel facts for EVERY panel.
+        Phase 2a UNDERSTAND         → one text pass reads all facts → identity map
+                                      + arc outline (full-chapter hindsight).
+        Phase 2b NARRATE (windowed) → every panel gets one tight line, using the
+                                      identity map + a rolling compressing summary.
+
+    Unlike /narrate (forward-only 2-3 panel batches), this sees the whole chapter
+    before writing, so a character revealed late is named from their first panel,
+    and the summary carries the thread across windows and into the next chapter."""
+    import time
+    from ai import recap_narrator, model_caps
+    log_lines = []
+    log_id = db.log_adhoc_start("recap_narrate", "Recap")
+
+    def _log(msg, level="info"):
+        log_lines.append({"timestamp": time.time(), "level": level, "message": msg})
+        db.log_adhoc_update(log_id, "running", log_lines)
+
+    def _finish(status, error=""):
+        db.log_adhoc_update(log_id, status, log_lines, error)
+
+    if not req.images:
+        _log("No panels to narrate", "error"); _finish("failed", "No images in batch")
+        raise HTTPException(400, "No images in batch")
+
+    vprovider = db.get_setting("ai_provider_narrate", "nvidia")   # VISION
+    tprovider = db.get_setting("ai_provider_refine", "nvidia")    # TEXT reasoning
+    nvidia_key = db.get_setting("nvidia_api_key", "")
+    gemini_key = db.get_setting("gemini_api_key", "")
+    vmodel = _model_for_provider(db, vprovider, "narrate")
+    rmodel = _model_for_provider(db, tprovider, "refine")
+    lm_model = db.get_setting("lm_studio_model", "")
+    try:    ctx = int(db.get_setting("lm_studio_context_length", "32768"))
+    except (TypeError, ValueError): ctx = 32768
+
+    b64s = [(img.get("data") or "").split(",", 1)[-1] for img in req.images]
+    idxs = [int(img.get("index", i)) for i, img in enumerate(req.images)]
+    style = (req.prompt or "").strip() or (
+        "Engaging, dramatic, CONCISE third-person recap narration — present tense, punchy, "
+        "one or two short sentences per beat, no filler.")
+
+    # Vision chunk size = the user's "Recap panels per call" setting, capped to the
+    # model's real image limit. Smaller chunks read each panel more carefully
+    # (less hallucination); the story pass still sees the whole chapter as text.
+    model_max = model_caps.caps_for(vmodel, vision=True)["max_images"] or 1
+    try:    pref = int(db.get_setting("recap_batch_size", "2"))
+    except (TypeError, ValueError): pref = 2
+    vmax = max(1, min(pref, model_max))
+    rmax = model_caps.output_cap(rmodel, vision=False, want=16000)
+
+    state = _load_recap_state(req.project_id)
+    if req.reset_memory:
+        state["memory"] = ""
+        _log("story memory reset for a new chapter (confirmed memory kept)", "muted")
+
+    _log(f"▶ Whole-chapter recap of {len(b64s)} panel(s) — vision {vmodel} ({vprovider}, "
+         f"{vmax}/call of a {model_max}-image limit), story {rmodel} ({tprovider}, out≤{rmax})", "accent")
+    try:
+        # ── Phase 1: VISION in chunks — gather rich facts for every panel ──
+        # Downscale panels for the vision model (keeps requests under the payload
+        # limit and is faster), then chunk by BOTH image count and byte size.
+        _log("vision: preparing panel images (downscaling for the vision model)…", "muted")
+        b64s = [_shrink_b64_for_vision(b) for b in b64s]
+        chunks = list(_vision_chunks(b64s, idxs, vmax))
+        facts_by_idx: dict = {}
+        for ci, (chunk, chunk_ids) in enumerate(chunks, 1):
+            mb = sum(len(b) for b in chunk) / 1_000_000
+            _log(f"vision: chunk {ci}/{len(chunks)} — reading panel(s) "
+                 f"{chunk_ids[0]}–{chunk_ids[-1]} ({len(chunk)} img, ~{mb:.1f} MB)…", "muted")
+            cf = recap_narrator.extract_facts(
+                chunk, vprovider, nvidia_key=nvidia_key, nvidia_vision_model=vmodel,
+                gemini_key=gemini_key, gemini_vision_model=vmodel, log=_log)
+            for ix, f in zip(chunk_ids, cf):
+                facts_by_idx[ix] = f
+        facts = [facts_by_idx.get(ix, {}) for ix in idxs]
+        _log(f"vision: gathered facts for {len(facts)} panel(s)", "muted")
+        if req.use_magi:
+            _add_magi_visual_evidence(b64s, facts, _log)
+            _log("Magi v3: attached character, text, tail and dialogue-link evidence", "muted")
+
+        # ── Phase 2a: UNDERSTAND — read everything, resolve identity w/ hindsight ──
+        from ai import story_memory
+        retrieved = story_memory.retrieve_context(db, req.project_id, facts, state.get("registry", {}))
+        _log("story memory: retrieved a bounded set of prior identity evidence", "muted")
+        _log(f"story: {rmodel} reading the whole chapter to resolve identities…", "muted")
+        bible = recap_narrator.build_story_bible(
+            facts, idxs, state, provider=tprovider, nvidia_key=nvidia_key,
+            lm_model=lm_model, context_length=ctx, log=_log, retrieved_memory=retrieved)
+        tag_to_id = story_memory.record_chapter_identities(
+            db, req.project_id, facts, idxs, bible, state.get("registry", {}))
+
+        # ── Phase 2b: NARRATE — windowed, every panel a tight name-aware line ──
+        result = recap_narrator.narrate_all(
+            facts, idxs, style, state, provider=tprovider, nvidia_key=nvidia_key,
+            lm_model=lm_model, context_length=ctx, log=_log, max_tokens=rmax, bible=bible)
+        story_memory.record_narrated_events(db, req.project_id, result["lines"], facts, idxs, tag_to_id)
+    except Exception as exc:
+        _log(f"Narration failed: {exc}", "error"); _finish("failed", str(exc))
+        raise HTTPException(502, f"Narration failed: {exc}")
+
+    _save_recap_state(req.project_id, state)
+    n = sum(1 for l in result["lines"] if l["text"])
+    _log(f"✓ Narrated {n}/{len(idxs)} panel(s)", "success")
+    _finish("done")
+    return {"lines": result["lines"], "memory": state.get("memory", "")}
 
 
 @router.get("/session/{project_id}")
@@ -451,6 +729,15 @@ def save_panel(req: SavePanelRequest, db: Database = Depends(get_db)):
         raw.write_bytes(base64.b64decode(d))
     except Exception as exc:
         raise HTTPException(400, f"Bad image data: {exc}")
+    # Re-cropping invalidates any previous upscale of this cue — delete it so
+    # "Upscale all" regenerates from the LATEST saved crop (it skips panels that
+    # already have an _up file, which would otherwise export the stale image).
+    for stale in (panels / f"cue_{req.cue_index:04d}_up.jpg",
+                  panels / f"cue_{req.cue_index:04d}_up.png"):
+        try:
+            if stale.exists(): stale.unlink()
+        except OSError:
+            pass
     return {"ok": True, "image": _files_url(raw), "raw": _files_url(raw)}
 
 

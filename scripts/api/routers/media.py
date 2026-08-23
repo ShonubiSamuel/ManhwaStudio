@@ -25,12 +25,51 @@ not a new capability.  We still reject directories and non-existent paths.
 from __future__ import annotations
 
 import mimetypes
+import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse
+import config
 
 router = APIRouter(tags=["Media"])
+
+
+@router.post("/media/import")
+async def import_media(request: Request, filename: str = Query(..., description="Original file name")):
+    """Accept a locally selected browser file and return its stable local path.
+
+    Native pywebview can reveal an absolute path, but normal/in-app browsers
+    deliberately cannot. This raw-body upload keeps the same path-based media
+    reader working in both environments without requiring ``python-multipart``.
+    """
+    safe_name = Path(filename).name.strip()
+    if not safe_name or safe_name in {".", ".."}:
+        raise HTTPException(400, "A file name is required")
+    if not safe_name.lower().endswith(".pdf"):
+        raise HTTPException(400, "Please select a PDF file")
+
+    dest_dir = Path(config.OUTPUT_DIR) / "imports"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{uuid.uuid4().hex[:12]}_{safe_name}"
+    size = 0
+    try:
+        with dest.open("wb") as out:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > 500 * 1024 * 1024:
+                    raise HTTPException(413, "PDF is larger than the 500 MB import limit")
+                out.write(chunk)
+    except HTTPException:
+        dest.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(500, f"Couldn't save the selected PDF: {exc}")
+    if not size:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, "The selected PDF was empty")
+    return {"path": str(dest), "filename": safe_name}
 
 
 @router.get("/media")
