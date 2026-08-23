@@ -79,10 +79,46 @@ Model weights — Whisper, Magi v3, and the TTS backend — are **not committed*
 
 Working, and used to produce real output — but a personal tool, not a product. Known gaps, stated plainly:
 
-- **No automated evaluation.** There is no BLEU / COMET / WER harness in this repository. Translation and dub quality are assessed by listening. This is the most valuable thing missing, and the next thing worth building.
-- **No test suite.**
+- **Evaluation is fit-only so far.** `scripts/eval/` measures whether dubs *fit* their
+  time slots (see below); BLEU/chrF/WER need reference translations and transcripts,
+  which don't exist yet. Semantic quality is still assessed by listening.
+- **No test suite outside `scripts/eval/tests/`.**
 - Source media, generated audio and rendered video are gitignored; only code is tracked.
 - Language coverage depends on the configured TTS backend.
+
+## Evaluation
+
+`scripts/eval/` scores dub quality. The fit metrics are **reference-free** — they need
+nothing but the pipeline's own output, so they run on every session already on disk and
+can gate a regression in CI:
+
+```bash
+python -m scripts.eval                                  # writes docs/eval/report.{md,json}
+python -m scripts.eval --fail-on-overrun 0.05           # CI gate
+python -m scripts.eval --references refs.json           # adds BLEU/chrF/WER
+python -m pytest scripts/eval/tests -q                  # 26 unit tests
+```
+
+Current results over 147 cues in 7 sessions ([full report](docs/eval/report.md)):
+
+| Lang | Cues | Coverage | Median CPS | Comfortable | Rushed | Overrunning |
+|---|---:|---:|---:|---:|---:|---:|
+| en | 84 | 100.0% | 18.0 | 71.4% | 7.1% | 7.1% |
+| fr | 63 | 100.0% | 18.26 | 76.2% | 15.9% | 15.9% |
+
+The distinction that matters: **rushed** is a quality problem (audibly hurried),
+**overrunning** is a correctness problem (the line cannot fit even at maximum rate, so
+it collides with the next cue). Two findings from the first run:
+
+- **French overruns at twice the English rate** (15.9% vs 7.1%) — French expands more
+  against the source, and the shortening loop isn't fully absorbing it.
+- **The `cps` value stored on each cue is stale.** Recomputing from the text that
+  actually shipped disagrees by >1 char/sec on 85 of 147 cues (mean 2.9, worst session
+  7.1). Anything reading `cue["cps"]` downstream is reading a pre-shortening value.
+
+`--references` accepts a JSON file keyed by session id with `translations` and
+`transcript` arrays in cue order; `sacrebleu` and `jiwer` are optional and imported
+lazily, so the harness always runs without them.
 
 ## Legal
 

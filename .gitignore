@@ -214,3 +214,6 @@ output/
 studio.db
 *.db
 *.mcpb
+
+# ---- Eval artefacts (regenerate with: python -m scripts.eval) ----
+docs/eval/report.json

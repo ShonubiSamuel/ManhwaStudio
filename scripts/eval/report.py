@@ -1,0 +1,219 @@
+"""
+eval/report.py — load dub sessions, score them, render a report.
+
+Reads `output/<id>/dub_session.json`, scores each session with metrics.py, and
+emits both a Markdown table (for humans and for the README) and JSON (for CI to
+diff between runs).
+
+No cue text is written to the report. The sessions contain licensed source
+material, so only aggregate numbers leave this module.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from . import metrics
+from .references import available, score_asr, score_translation
+
+
+@dataclass
+class Session:
+    sid: str
+    path: Path
+    lang: str
+    cues: list[dict]
+
+    @property
+    def duration_sec(self) -> float:
+        if not self.cues:
+            return 0.0
+        try:
+            return max(float(c.get("end", 0) or 0) for c in self.cues)
+        except (TypeError, ValueError):
+            return 0.0
+
+
+def load_sessions(output_dir: Path) -> list[Session]:
+    """Load every dub_session.json under output_dir, newest id last."""
+    sessions: list[Session] = []
+    for p in sorted(output_dir.glob("*/dub_session.json")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        cues = data.get("cues") or []
+        if not isinstance(cues, list) or not cues:
+            continue
+        lang = data.get("targetLang") or data.get("selectedLang") or ""
+        sessions.append(Session(sid=p.parent.name, path=p, lang=lang, cues=cues))
+    sessions.sort(key=lambda s: (len(s.sid), s.sid))
+    return sessions
+
+
+def score_session(sess: Session, refs: dict[str, Any] | None = None) -> dict[str, Any]:
+    fit = metrics.evaluate_fit(sess.cues, sess.lang)
+    row: dict[str, Any] = {
+        "session": sess.sid,
+        "lang": sess.lang,
+        "lang_code": metrics.lang_code(sess.lang),
+        "cues": fit.cues,
+        "translated": fit.translated,
+        "empty": fit.empty,
+        "coverage": round(fit.coverage, 4),
+        "mean_cps": round(fit.mean_cps, 2),
+        "median_cps": round(fit.median_cps, 2),
+        "p95_cps": round(fit.p95_cps, 2),
+        "comfortable_rate": round(fit.comfortable_rate, 4),
+        "rushed_rate": round(fit.rushed_rate, 4),
+        "overrun_rate": round(fit.overrun_rate, 4),
+        "total_overrun_sec": round(fit.total_overrun_sec, 2),
+        "worst_overrun_sec": round(fit.worst_overrun_sec, 2),
+        "mean_length_ratio": round(fit.mean_length_ratio, 3),
+        "media_duration_sec": round(sess.duration_sec, 1),
+        "stored_cps_drift": metrics.shortening_effectiveness(sess.cues, sess.lang),
+    }
+
+    if refs and sess.sid in refs:
+        entry = refs[sess.sid] or {}
+        hyp_t = [metrics._translated_text(c) for c in sess.cues]
+        if entry.get("translations"):
+            try:
+                row["translation"] = score_translation(hyp_t, entry["translations"])
+            except Exception as exc:
+                row["translation"] = {"error": str(exc)}
+        if entry.get("transcript"):
+            try:
+                row["asr"] = score_asr([metrics._source_text(c) for c in sess.cues], entry["transcript"])
+            except Exception as exc:
+                row["asr"] = {"error": str(exc)}
+    return row
+
+
+def aggregate(sessions: list[Session]) -> dict[str, Any]:
+    """Overall totals, plus a per-language breakdown."""
+    overall = metrics.FitReport()
+    by_lang: dict[str, metrics.FitReport] = {}
+    for s in sessions:
+        fit = metrics.evaluate_fit(s.cues, s.lang)
+        overall = overall.merge(fit)
+        code = metrics.lang_code(s.lang) or "?"
+        by_lang[code] = by_lang[code].merge(fit) if code in by_lang else fit
+
+    def summarise(f: metrics.FitReport) -> dict[str, Any]:
+        return {
+            "cues": f.cues,
+            "translated": f.translated,
+            "coverage": round(f.coverage, 4),
+            "mean_cps": round(f.mean_cps, 2),
+            "median_cps": round(f.median_cps, 2),
+            "p95_cps": round(f.p95_cps, 2),
+            "comfortable_rate": round(f.comfortable_rate, 4),
+            "rushed_rate": round(f.rushed_rate, 4),
+            "overrun_rate": round(f.overrun_rate, 4),
+            "total_overrun_sec": round(f.total_overrun_sec, 2),
+            "mean_length_ratio": round(f.mean_length_ratio, 3),
+        }
+
+    return {"overall": summarise(overall), "by_language": {k: summarise(v) for k, v in sorted(by_lang.items())}}
+
+
+def _pct(x: float) -> str:
+    return f"{100 * x:.1f}%"
+
+
+def render_markdown(rows: list[dict[str, Any]], agg: dict[str, Any]) -> str:
+    out: list[str] = []
+    out.append("# Dub evaluation report\n")
+    out.append(
+        "Reference-free fit metrics: whether each translated line can be spoken "
+        "naturally in the time the original occupied. Generated by "
+        "`python -m scripts.eval`.\n"
+    )
+    o = agg["overall"]
+    out.append(
+        f"**{o['cues']} cues across {len(rows)} sessions.** "
+        f"Coverage {_pct(o['coverage'])} · median {o['median_cps']} CPS · "
+        f"{_pct(o['comfortable_rate'])} comfortable · {_pct(o['rushed_rate'])} rushed · "
+        f"{_pct(o['overrun_rate'])} overrunning.\n"
+    )
+    out.append(
+        f"Thresholds from {metrics.CONFIG_SOURCE}: comfortable "
+        f"{metrics.CPS_COMFORTABLE} CPS, max {metrics.CPS_MAX} "
+        f"(CJK {metrics.CPS_COMFORTABLE_CJK}/{metrics.CPS_MAX_CJK}).\n"
+    )
+
+    out.append("## By language\n")
+    out.append("| Lang | Cues | Coverage | Median CPS | p95 CPS | Comfortable | Rushed | Overrunning | Len ratio |")
+    out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for code, s in agg["by_language"].items():
+        out.append(
+            f"| {code} | {s['cues']} | {_pct(s['coverage'])} | {s['median_cps']} | {s['p95_cps']} | "
+            f"{_pct(s['comfortable_rate'])} | {_pct(s['rushed_rate'])} | {_pct(s['overrun_rate'])} | "
+            f"{s['mean_length_ratio']} |"
+        )
+    out.append("")
+
+    out.append("## By session\n")
+    out.append("| Session | Lang | Cues | Coverage | Median CPS | Comfortable | Rushed | Overrun (s) | Len ratio |")
+    out.append("|---|---|---:|---:|---:|---:|---:|---:|---:|")
+    for r in rows:
+        out.append(
+            f"| {r['session']} | {r['lang_code'] or '?'} | {r['cues']} | {_pct(r['coverage'])} | "
+            f"{r['median_cps']} | {_pct(r['comfortable_rate'])} | {_pct(r['rushed_rate'])} | "
+            f"{r['total_overrun_sec']} | {r['mean_length_ratio']} |"
+        )
+    out.append("")
+
+    drift = [r for r in rows if r["stored_cps_drift"]["drifted"]]
+    out.append("## Stored-vs-recomputed CPS\n")
+    if drift:
+        out.append(
+            "Sessions where the `cps` recorded on a cue disagrees with the value "
+            "recomputed from the text that shipped (>1 char/sec). Indicates stale "
+            "metadata after the shortening loop.\n"
+        )
+        out.append("| Session | Checked | Drifted | Mean abs delta |")
+        out.append("|---|---:|---:|---:|")
+        for r in drift:
+            d = r["stored_cps_drift"]
+            out.append(f"| {r['session']} | {d['checked']} | {d['drifted']} | {d['mean_abs_delta']:.2f} |")
+    else:
+        out.append("No drift: every stored `cps` matches the shipped text. ✅")
+    out.append("")
+
+    ref_rows = [r for r in rows if "translation" in r or "asr" in r]
+    out.append("## Reference-based scores\n")
+    if ref_rows:
+        out.append("| Session | BLEU | chrF | WER | CER | Scored |")
+        out.append("|---|---:|---:|---:|---:|---:|")
+        for r in ref_rows:
+            t, a = r.get("translation", {}), r.get("asr", {})
+            out.append(
+                f"| {r['session']} | {t.get('bleu', '—')} | {t.get('chrf', '—')} | "
+                f"{a.get('wer', '—')} | {a.get('cer', '—')} | {t.get('scored', a.get('scored', 0))} |"
+            )
+    else:
+        avail = available()
+        missing = [k for k, v in avail.items() if not v]
+        out.append(
+            "No reference data supplied, so no BLEU/chrF/WER was computed. "
+            "Pass `--references refs.json` to enable these. "
+            + (f"Install first: `pip install {' '.join(missing)}`." if missing else "")
+        )
+    out.append("")
+
+    out.append("## How to read this\n")
+    out.append(
+        "- **Comfortable** — the line speaks within the language's natural rate. Higher is better.\n"
+        "- **Rushed** — above the maximum rate; audible as hurried delivery.\n"
+        "- **Overrunning** — too long even at the maximum rate, so it *will* collide "
+        "with the next cue. This is the metric that matters most; rushed is a quality "
+        "problem, overrunning is a correctness problem.\n"
+        "- **Len ratio** — achieved characters over the ideal for the slot. 1.0 is on target; "
+        "below 1.0 means the translation is shorter than the time allows.\n"
+    )
+    return "\n".join(out)
