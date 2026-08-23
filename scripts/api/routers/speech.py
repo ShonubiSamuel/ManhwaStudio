@@ -1354,6 +1354,32 @@ def put_dub_session(project_id: int, body: dict, db: Database = Depends(get_db))
         raise HTTPException(404, f"Project {project_id} not found")
     p = _session_path(project_id)
     p.parent.mkdir(parents=True, exist_ok=True)
+
+    # `cps` and `rushed` are derived from a cue's text and timings, but they are
+    # stored on the cue for the UI. Any edit - retranslate, refine, split, merge,
+    # re-segment - can leave them stale, or (after re-segmentation) attached to
+    # the wrong cue. Recompute here so what lands on disk is always consistent
+    # with the text beside it, whichever path produced it.
+    cues = body.get("cues")
+    if isinstance(cues, list) and cues:
+        import time as _t
+        from speech import cps as _cps
+        lang = body.get("targetLang") or body.get("selectedLang") or ""
+        try:
+            fixed = _cps.recompute_cue_metrics(cues, lang)
+            if fixed:
+                db.log_adhoc_activity(
+                    "save_dub_session", "done", 0.0,
+                    [{"timestamp": _t.time(), "level": "info",
+                      "message": f"Recomputed cps/rushed on {fixed} cue(s) before saving"}],
+                )
+        except Exception as exc:
+            # Never fail a save over a derived field.
+            import time as _t
+            log_msg = f"Could not recompute cue metrics: {exc}"
+            db.log_adhoc_activity("save_dub_session", "done", 0.0,
+                                  [{"timestamp": _t.time(), "level": "warning", "message": log_msg}])
+
     try:
         p.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:

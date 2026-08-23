@@ -77,15 +77,10 @@ def translate_cues(
                   else rs.get_int("lm_studio_max_concurrent", 4))
 
     def _eff_dur(n):
-        """EFFECTIVE speaking window for cue n: the dub engine lets audio run
-        until the NEXT cue starts (minus a breath), so trailing dead air is
-        usable time. Judging CPS against the raw end−start flags cues as rushed
-        that actually fit fine — then wastes shorten calls fighting a phantom."""
-        cue = cues[n]
-        raw = max(0.0, float(cue["end"]) - float(cue["start"]))
-        if n + 1 < len(cues):
-            return max(raw, float(cues[n + 1]["start"]) - float(cue["start"]) - 0.24)
-        return raw
+        """EFFECTIVE speaking window for cue n. Delegates to cps.effective_duration
+        so this path, refine_cue and the UI all judge the same window — they used
+        to disagree, which left the stored `cps` dependent on which path ran."""
+        return cps.effective_duration(cues, n)
 
     def _is_rushed(n, tr):
         d = _eff_dur(n)

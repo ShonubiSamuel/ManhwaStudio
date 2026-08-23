@@ -1318,7 +1318,10 @@ function AdvancedEditor({ projectId, onBack, cues, setCues, sourcePath, ttsAudio
       const start = Math.min(a.start ?? 0, b.start ?? 0)
       const end = Math.max(a.end ?? 0, b.end ?? 0)
       const translated = translations[targetLang] || join([a.translated, b.translated])
-      const cps = computeCps(translated, Math.max(0, effDur(prev, idx)))
+      // Score against the merged span, not effDur(prev, idx): after a merge the
+      // indices in `prev` no longer line up, so this silently measured the
+      // wrong window.
+      const cps = computeCps(translated, Math.max(0, end - start))
       const merged = {
         ...a,
         text: join([a.text, b.text]),
@@ -2851,12 +2854,19 @@ const CPS_MAX = 24.0   // non-CJK "rushed" threshold — keep in sync with confi
  *  NEXT cue starts (minus a breath), so dead air after a short slot is usable
  *  time. Judging CPS against the raw end−start was a phantom constraint — lines
  *  looked "stuck" at 26+ CPS when their audio actually fit fine. */
+// Mirrors speech/cps.py::effective_duration. These two MUST agree: when they
+// drifted, a cue's stored `cps` depended on whether Python or the UI last wrote
+// it, and sessions with identical timings ended up with different numbers.
+// MIN_GAP matches config.DUB_SPEECH_MIN_GAP.
+const MIN_GAP = 0.24
+
 function effDur(cues, i) {
-  const c = cues[i]
+  const c = cues?.[i]
+  if (!c) return 0
   const dur = Math.max(0, (c.end ?? 0) - (c.start ?? 0))
   const nxt = cues[i + 1]
   if (!nxt) return dur
-  return Math.max(dur, (nxt.start ?? c.end ?? 0) - (c.start ?? 0) - 0.24)
+  return Math.max(dur, (nxt.start ?? c.end ?? 0) - (c.start ?? 0) - MIN_GAP)
 }
 
 function computeCps(text, durationSec) {
