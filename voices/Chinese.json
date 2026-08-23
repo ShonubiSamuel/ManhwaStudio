@@ -5,7 +5,7 @@
   "language": "Chinese",
   "speaker": "",
   "instruct": "",
-  "ref_wav_path": "/Users/samuelshonubi/Documents/ManhwaStudio/voices/refs/Chinese.wav",
+  "ref_wav_path": "/Users/samuelshonubi/Code/personal/manhwa-studio/voices/refs/Chinese.wav",
   "ref_wav_text": "有些日子很安静,但安静也是一种陪伴。 你好,我是Evan。 我的声音温柔自然, 适合配音中文有声书和语言教学类内容, 稳定清晰,节奏平稳。 如果你需要一个可靠且亲切的中文男生, 我愿意用声音为你表达。 谢谢您的收听。",
   "x_vector_only": false,
   "temperature": 0.7,

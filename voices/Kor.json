@@ -5,7 +5,7 @@
   "language": "Korean",
   "speaker": "",
   "instruct": "",
-  "ref_wav_path": "/Users/samuelshonubi/Documents/ManhwaStudio/voices/refs/Kor.wav",
+  "ref_wav_path": "/Users/samuelshonubi/Code/personal/manhwa-studio/voices/refs/Kor.wav",
   "ref_wav_text": "\uc758\uc2dd\uc740 \uc5ec\uc804\ud788 \ub9ce\uc740 \ubbf8\uc2a4\ud130\ub9ac\ub97c \uac00\uc9c0\uace0 \uc788\ub294 \uc8fc\uc81c\uc785\ub2c8\ub2e4. \uc758\uc2dd\uc740 \uc6b0\ub9ac\uac00 \uc790\uc2e0\uc744 \uc778\uc2dd\ud558\uace0 \uc678\ubd80 \uc138\uacc4\uc640 \uc0c1\ud638\uc791\uc6a9\ud558\ub294 \ub2a5\ub825\uc744 \ub9d0\ud569\ub2c8\ub2e4. \ub1cc\uc758 \ud2b9\uc815 \ubd80\uc704, \ud2b9\ud788 \ub300\ub1cc\ud53c\uc9c8\uacfc \uad00\ub828\uc774 \uae4a\uc2b5\ub2c8\ub2e4.",
   "x_vector_only": false,
   "temperature": 0.7,

@@ -5,7 +5,7 @@
   "language": "French",
   "speaker": "Aiden",
   "instruct": "",
-  "ref_wav_path": "/Users/samuelshonubi/Documents/ManhwaStudio/voices/refs/Nicolas.wav",
+  "ref_wav_path": "/Users/samuelshonubi/Code/personal/manhwa-studio/voices/refs/Nicolas.wav",
   "ref_wav_text": "Dans un monde où le pouvoir est roi, les faibles sont oubliés avant même de tomber. Je ne faisais pas exception : rejeté, humilié, laissé pourrir au bas d'une hiérarchie qui n'a jamais daigné poser les yeux sur moi.",
   "x_vector_only": false,
   "temperature": 0.7,
